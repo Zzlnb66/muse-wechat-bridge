@@ -46,11 +46,9 @@
 - 不要在公开材料里写“彻底解决提示注入”“保证任何恶意内容都无法越权”。
 
 ## 第三方来源与许可证（能核实的写清楚，无法确认的单独列出）
-
-- **Tencent openclaw-weixin**：协议与 Phase 2 参考，commit `874637a0dbc24050f72d1385add4fc6170a2d726`，协议文档 `docs/protocol.md`。许可证：**无法确认**（本导出未核对该仓库的 LICENSE 文件，不要自行认定）。
+- **Tencent openclaw-weixin**：协议与 Phase 2 参考，commit `874637a0dbc24050f72d1385add4fc6170a2d726`，协议文档 `docs/protocol.md`。许可证：见 THIRD_PARTY_NOTICES.md——2026-10-28 网页快照显示 main LICENSE 为 MIT，且该快照下当前提交恰好就是该提交；本地 git show 取证尚未贴入，仍为待最终闭环项。
 - **Python 标准库、Pillow、openssl、curl、qrcode**：均为通用依赖，许可证以各自上游为准，本导出未逐一核对。
 - **Muse 运行环境、Hook、Worker**：属于 Muse 提供的能力，**不是本仓库可公开的代码**，不要把 Muse 的私有内部实现当成开源内容。
-- **本仓库原创部分**：`bridge.py` 及本文档由项目作者在 Muse 环境里编写；是否使用 MIT 等许可证，**由作者决定，本导出不自行认定**。建议作者在发布前明确写入 LICENSE 文件，并核对上述第三方许可证的兼容性。
-
+- **本仓库原创部分**：`bridge.py` 及本文档由项目作者在 Muse 环境里编写；是否使用 MIT 等许可证，- **本仓库原创部分**：`bridge.py` 及本文档由项目作者编写；许可证为 MIT，见仓库根目录 LICENSE 文件（Copyright (c) 2026 ZZLNB）。
 ## 账号安全表述
 走腾讯官方 iLink 授权通道，风险低于传统逆向外挂，但不承诺免受平台灰度规则变动影响，也不代表永久免责或零风险。
