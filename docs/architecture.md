@@ -82,4 +82,4 @@ bridge.py 的 _sender_loop（独立发送线程，每 1 秒排空，修复版 R8
 
 - 本修复版 `bridge.py` 共 2337 行（原始公开导出为 2092 行，修复后行数已变，不要再写“2092 行修复版”），与 2026-10-28 06:02 部署的运行版本字节对应，SHA-256 7cd359dd5ecbab4904f5cbea6f9bc153adae37a368a134dc4533df39175177ba。
 - 唯一需要提醒的注释滞后：`process_inbound_image()` 里仍有一段注释写“完整重试一次”，实际最新代码是“`urllib` 第一次不完整就直接转 `curl`”，不再做第二次 `urllib`（见开发史最后一项）。注释未同步更新，代码行为以实际循环为准。
-- 看门狗定义、Worker 提示词**不在本导出**，因为它们属于 Muse 环境配置，不是 `bridge.py`；本文件只整理了它们的行为，读者需要在自己的 Muse 环境里重建。
+- 看门狗定义、Worker 提示词本身**不在本仓库**（它们属于 Muse 环境配置，不是 `bridge.py`），但本仓库含 `examples/hook-config-template.md` 和 `examples/worker-prompt-template.md` 模板；本文件只整理了它们的行为，读者需要在自己的 Muse 环境里重建。
