@@ -39,7 +39,7 @@
 |---|---|---|
 | 桥接进程 `bridge.py serve` | Muse 提供的云端虚拟机（Linux，`~/workspace/wechat-bridge/`） | 是，本仓库 `bridge.py` |
 | 文件队列 `inbox/`、`done/`、`outbox/pending|sent|failed/`、`media/`、`failures/`、`state/` | 同一台虚拟机上的本地目录 | 是，`bridge.py` 的目录约定 |
-| 看门狗 Hook 脚本 | Muse 的 Hook 调度环境，每 5 秒轮询一次（见架构文档） | 部分：本导出只含桥接侧说明，Hook 定义本身属于 Muse 环境配置，**不在本仓库** |
+| 看门狗 Hook 脚本 | Muse 的 Hook 调度环境，每 5 秒轮询一次（见架构文档） |部分：本仓库含 `examples/hook-config-template.md` 模板，Hook 本身的实际定义属于 Muse 环境配置，**不在本仓库**|
 | Worker（生成回复的 Muse 代理） | Muse 的代理运行环境，由 Hook 唤醒 | **不是本仓库代码**；它的提示词、历史加载、图片阅读、工具权限都依赖 Muse |
 | 微信 / iLink / CDN | 腾讯侧：`https://ilinkai.weixin.qq.com`，CDN `https://novac2c.cdn.weixin.qq.com/c2c` | 第三方平台，不是本项目开发 |
 
@@ -87,7 +87,8 @@ python3 bridge.py serve
 ## 已知限制（摘要，完整版见各文档）
 
 - 回复慢：看门狗 5 秒轮询 + 下载重试/`curl` + Worker 看图排队，实测两张图约 1 分钟才陆续发出。
-- 一条消息里同时带两张图：**未验证**（已验证的是分两条各发一张）。
+- 一条消息里同时带两张图：**代码分支未验证**——一次选两张图时 iLink 会拆成两条独立单图消息（2026-10-28 06:07–06:09 实测，两张均收到），用户体验上已通，但“一条消息带 2 张图”的代码分支至今未真正跑过（见 docs/testing.md）。
+
 - 虚拟机整体替换恢复：**未验证**（只验证过进程被杀后拉起）。
 - 提示注入：只通过了两个样例（发邮件、连接 OpenClaw），**不能写成彻底解决**。
 - 下载截断的底层根因：已证实 `urllib` 截断、`curl` 能救回，但 CDN、代理、网络链路哪一环导致，**无法确认**。
