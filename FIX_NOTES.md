@@ -126,3 +126,17 @@
 - **测试**：新增 `tests/test_v102.py`（Bearer 脱敏 + curl/upload 超时、unknown_restart / 全终态 / 旧格式 image_path 在清空内存集合模拟重启后仍不重发、子项拦截、双路径错误脱敏，全部 PASS）；`tests/test_v101.py`、`tests/test_regression.py`、`tests/test_r8_timing.py` 仍 PASS。真实微信实测尚未做，v1.0.2 不能写成已验证。
 
 - **v1.0.2 边界补修（用户复核，部署前）**：`drain_outbox` 原来用 `any_terminal`（任一子项 failed/needs_check）就把整单写 `terminal=True` 并移入 failed/，导致同单里 RetryableError 的子项（pending，attempts=1）失去剩下 2 次重试。修法：归档条件收紧为 `_is_terminal_job(job)`（全部子项已 sent/failed/needs_check 且至少一项 failed/needs_check）；只要还有子项 pending，就留在 pending/，下一轮子项拦截会跳过已终态子项、只重试 pending 子项。测试 `test_v102.py` 新增 2d/4：第一轮 retryable+permanent 后任务仍在 pending、terminal 未置、状态分别为 pending/failed；第二轮 pending 子项成功、failed 子项跳过，任务才归档到 failed/。本补丁后 bridge.py 为 2534 行，SHA 3535d58bfc5c210abbca2aca3c49b1a6ea16ba1fb6ee478ebb5eeeb75021fec7，README 已同步；2026-10-29 00:01 已部署，00:11-00:13 最小微信实测 4 项全部通过，Tag v1.0.2 已打。
+
+
+## v1.0.3（2026-10-29，用户独立复核 v1.0.2 后的收尾，本地修复副本，未部署、未发布、未做微信实测）
+- **网络诊断**：新增 `_describe_urllib_error(e)`——`URLError` 的具体原因在 `e.reason` 里，日志现在写 `URLError(ConnectionRefusedError: errno=111: ...)` 或 `URLError(TimeoutError: ...)`，连接拒绝和超时一眼可分，且不带请求 URL；`_effective_proxy_host_port(target_url)` 在返回代理前先用 `urllib.request.proxy_bypass(host)` 判定，命中 `NO_PROXY` / `no_proxy` 时返回 `none (no_proxy bypass)`，与 urllib 自身的绕过行为一致，不再误报代理。post_json / get_json 的 curl+urllib 双路径错误和 HTTPError 路径都已传 target_url。
+- **异常链切断**：6 处包装点全部加 `from None`：aes_ecb_encrypt / aes_ecb_decrypt 的 TimeoutExpired；_post_via_curl / _get_via_curl 的 TimeoutExpired 和通用异常；send_image CDN 上传 curl 的 TimeoutExpired 和通用异常；send_image CDN 上传 urllib 回退的通用异常。注意：`from None` 设置的是 `__suppress_context__ = True` / `__cause__ = None`，**不会把 `__context__` 清空**——断言 `__context__ is None` 对正确代码也会失败，正确断言是抑制标志 + 格式化堆栈里没有 "During handling of the above exception" 且没有密钥/URL。
+- **人工重投文档**：docs/troubleshooting.md 的 needs_check 处置已按 v1.0.3 修正为 5 步（逐子项确认未送达 → 仅该子项改 pending 且 attempts 重置为 0 → 删顶层 terminal → 移回 pending/ → 重启 serve 或改名 `<id>_retry.json` 以绕过内存 _TERMINAL_TASK_IDS）；不改 _TERMINAL_TASK_IDS 的拦截优先级，因为它只防“移入 failed/ 失败的终态任务”被重复发，磁盘修好后重启/改名即可，逻辑最简单。
+- **测试**：新增 tests/test_v103.py（urllib 原因区分 + NO_PROXY bypass + 6 处 traceback 脱敏，含 6 处调用点全覆盖）；v101、v102、原回归、R8 时序全部仍 PASS。
+- 本补丁后 bridge.py 为 2572 行，SHA d41d9b0d86df8377119c56c32715f81e31482b979ae731d78bef7fadf690fd57（v1.0.3 最终版，含下面 P1/P2/P3），README 已同步，仍未部署、未发布、未实测。
+
+- **v1.0.3 最终版（P1/P2/P3，2026-10-29，新 Gemini 复核后）**：
+  - P1（仅文档，不改 bridge.py 旧 SHA 之外的部分）：docs/troubleshooting.md 第 3 步和 README needs_check 段落已分开写清——文本子项改顶层 text_status 且 text_attempts 重置为 0，附件子项改 attachments[i].status 且 attempts 重置为 0，旧格式单图改顶层 image_status；漏改 text_attempts 的后果（只剩 1 次机会）已写明；改名重投的 typing 票据小副作用（改名后查不到原票据，但人工重投时 typing 早已超时，无实际危害）已注明。
+  - P2（改代码）：_effective_proxy_host_port 改为先找代理、无代理直接返回 "none"，有代理且命中 proxy_bypass 才返回 "none (no_proxy bypass)"；test_v103.py 补了无代理 + NO_PROXY=* 时返回 "none" 的用例。
+  - P3（改代码）：post_json / get_json 的 4 处双路径 ApiError 汇总报错（HTTPError 和通用异常各 2 处）全部加 from None，使汇总错误本身的堆栈也干净；TokenExpired 的控制流信号未动。
+  - 最终版 bridge.py 为 2572 行，SHA d41d9b0d86df8377119c56c32715f81e31482b979ae731d78bef7fadf690fd57，5 套测试全部仍 PASS，复核包为 11 个文件（上一版说明误写 12 个，已更正）。
