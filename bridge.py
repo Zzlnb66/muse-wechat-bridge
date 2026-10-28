@@ -106,6 +106,50 @@ _SESSION_LOCK = _threading_top.RLock()
 # Gemini R5: files whose post-send state write failed are halted in
 # memory for this process lifetime, never re-sent by the sender loop.
 _IN_MEMORY_HALTED_FILES = set()
+# v1.0.1: terminal task ids whose failed/ move failed. Never resend in this process.
+_TERMINAL_TASK_IDS = set()
+
+def _terminal_attachments(job):
+    """Attachments for terminal checks, including the old single-image
+    format (job['image_path'] / job['image_status']) which drain_outbox
+    normalises only after _is_terminal_job was previously called."""
+    atts = job.get('attachments')
+    if isinstance(atts, list):
+        return atts
+    if job.get('image_path'):
+        return [{'status': job.get('image_status', 'pending')}]
+    return []
+
+
+def _is_terminal_job(job):
+    # v1.0.2: a job-level terminal marker, persisted on disk, is
+    # sufficient on its own. This covers delivery_state =
+    # 'unknown_restart' (startup recovery, where text/attachment
+    # statuses are still 'pending') and any job already moved to the
+    # terminal branch whose failed/ move failed. Memory-only sets
+    # must never be the sole guard across a process restart.
+    # NOTE: delivery_state 'failed'/'needs_check' alone is NOT a
+    # whole-job marker: drain_outbox sets delivery_state to the last
+    # item's status, so a job with text failed + attachment still
+    # pending has delivery_state='failed' but is NOT whole-terminal;
+    # treating it as terminal would block its pending sub-item.
+    # Whole-job terminal via delivery_state is only 'unknown_restart'.
+    if job.get('terminal') is True:
+        return True
+    if job.get('delivery_state') == 'unknown_restart':
+        return True
+    text = job.get('text')
+    atts = _terminal_attachments(job)
+    if not text and not atts:
+        return False
+    # All items are in a terminal state (sent/failed/needs_check) AND
+    # at least one item is failed/needs_check. An all-sent job is not
+    # terminal here: drain skips its items and moves it to sent/.
+    text_term = (not text) or job.get('text_status') in ('sent', 'failed', 'needs_check')
+    atts_term = all(isinstance(a, dict) and a.get('status') in ('sent', 'failed', 'needs_check') for a in atts)
+    has_bad = (bool(text) and job.get('text_status') in ('failed', 'needs_check')) or any(
+        isinstance(a, dict) and a.get('status') in ('failed', 'needs_check') for a in atts)
+    return bool(text_term and atts_term and has_bad)
 _SEND_COOLDOWN = {}
 
 DEFAULT_BASE = "https://ilinkai.weixin.qq.com"
@@ -205,6 +249,11 @@ def _sanitize_error(e):
     # that would also hide MD5/UUID/media IDs needed for debugging.
     # Only redact -K forms and explicit credential query fields.
     s = _re.sub(r"(aeskey|authkey|bot_token|context_token)=[^&\s\]\)]+", r"\1=[redacted]", s)
+    # v1.0.2: Bearer token in a curl -H argument, and JSON credential
+    # fields that can appear inside a -d request body in an exception.
+    s = _re.sub(r"Bearer\s+[^\s'\"]+", "Bearer [redacted]", s)
+    s = _re.sub(r'"(aeskey|authkey|bot_token|context_token)"\s*:\s*"[^"]*"', r'"\1": "[redacted]"', s)
+    s = _re.sub(r"'(aeskey|authkey|bot_token|context_token)'\s*:\s*'[^']*'", r"'\1': '[redacted]'", s)
     if "?" in s and "http" in s:
         s = s.split("http")[0] + "http [redacted]"
     return s
@@ -360,8 +409,13 @@ def _post_via_curl(url, headers, data, timeout):
     cmd += ["-d", data.decode("utf-8")]
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=int(timeout) + 10)
+    except subprocess.TimeoutExpired:
+        # v1.0.2: TimeoutExpired str() contains the full argv, including
+        # '-H', 'Authorization: Bearer <bot_token>' and the -d body.
+        # Never embed the exception text; the type is the whole message.
+        raise ApiError("curl POST timeout")
     except Exception as e:
-        raise ApiError(f"curl POST failed: {e}")
+        raise ApiError(f"curl POST failed: {type(e).__name__}")
     if r.returncode != 0:
         raise ApiError(f"curl POST exit {r.returncode}")
     return r.stdout
@@ -375,11 +429,43 @@ def _get_via_curl(url, headers, timeout):
         cmd += ["-H", f"{k}: {v}"]
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=int(timeout) + 10)
+    except subprocess.TimeoutExpired:
+        # v1.0.2: same rule as _post_via_curl; never embed argv text.
+        raise ApiError("curl GET timeout")
     except Exception as e:
-        raise ApiError(f"curl GET failed: {e}")
+        raise ApiError(f"curl GET failed: {type(e).__name__}")
     if r.returncode != 0:
         raise ApiError(f"curl GET exit {r.returncode}")
     return r.stdout
+
+
+def _desensitized_host_port(value):
+    """Return 'host:port' for a URL/proxy string, never userinfo or
+    password. Returns 'none' when absent or unparseable. v1.0.2."""
+    if not value:
+        return "none"
+    try:
+        parsed = urllib.parse.urlparse(value)
+        host = parsed.hostname
+        if not host:
+            return "none"
+        port = parsed.port
+        if port:
+            return f"{host}:{port}"
+        return f"{host}:{'443' if parsed.scheme == 'https' else '80'}"
+    except Exception:
+        return "none"
+
+
+def _effective_proxy_host_port():
+    """Proxy actually in effect for this process, host:port only.
+    Checks https_proxy first (iLink is https), then http_proxy/all_proxy.
+    v1.0.2: never print the proxy URL itself (it may embed credentials)."""
+    for key in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
+        value = os.environ.get(key)
+        if value:
+            return _desensitized_host_port(value)
+    return "none"
 
 
 def post_json(base, path, payload, session=None, authenticated=False, timeout=15, allow_fallback=True):
@@ -392,6 +478,10 @@ def post_json(base, path, payload, session=None, authenticated=False, timeout=15
     url = base.rstrip("/") + path
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = make_headers(session, authenticated)
+    # v1.0.2: keep the curl error, do NOT swallow it. If urllib also
+    # fails, the raised error must carry both paths, the desensitized
+    # target host:port, and the desensitized effective proxy host:port.
+    curl_err = None
     try:
         body = _post_via_curl(url, headers, data, timeout)
         if body:
@@ -400,13 +490,15 @@ def post_json(base, path, payload, session=None, authenticated=False, timeout=15
             except ValueError:
                 if not allow_fallback:
                     raise ApiError(f"{path}: non-JSON response, not treated as success")
-                pass
+                curl_err = "non-JSON response"
         elif not allow_fallback:
             raise ApiError(f"{path}: empty response body, not treated as success")
-    except ApiError:
+        else:
+            curl_err = "empty response body"
+    except ApiError as e:
         if not allow_fallback:
             raise
-        pass
+        curl_err = str(e)
     req = urllib.request.Request(
         url, data=data, headers=headers, method="POST"
     )
@@ -423,9 +515,11 @@ def post_json(base, path, payload, session=None, authenticated=False, timeout=15
         if isinstance(resp, dict) and (resp.get("ret") == -14 or resp.get("errcode") == -14):
             write_needs_relogin("http", f"HTTP {e.code} ret/errcode -14")
             raise TokenExpired(f"HTTP {e.code} with ret/errcode -14")
-        raise ApiError(f"HTTP {e.code} for {path}: {body[:500]!r}")
+        raise ApiError(f"HTTP {e.code} for {path}: {body[:500]!r} (curl_err={curl_err}; target={_desensitized_host_port(url)}; proxy={_effective_proxy_host_port()})")
+    except Exception as e:
+        raise ApiError(f"{path}: curl failed: {curl_err}; urllib failed: {type(e).__name__}; target={_desensitized_host_port(url)}; proxy={_effective_proxy_host_port()}")
     if not body:
-        raise ApiError(f"{path}: empty response body, not treated as success")
+        raise ApiError(f"{path}: empty response body, not treated as success (curl_err={curl_err})")
     try:
         return json.loads(body.decode("utf-8"))
     except ValueError:
@@ -440,23 +534,29 @@ def get_json(base, path, session=None, timeout=15):
         "iLink-App-ClientVersion": CLIENT_VERSION,
     }
     # Step 1: prefer curl, fall back to urllib once on curl failure.
+    # v1.0.2: same dual-error rule as post_json.
+    curl_err = None
     try:
         body = _get_via_curl(url, headers, timeout)
         if body:
             try:
                 return json.loads(body.decode("utf-8"))
             except ValueError:
-                pass
-    except ApiError:
-        pass
+                curl_err = "non-JSON response"
+        else:
+            curl_err = "empty response body"
+    except ApiError as e:
+        curl_err = str(e)
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read()
     except urllib.error.HTTPError as e:
-        raise ApiError(f"HTTP {e.code} for {path}")
+        raise ApiError(f"HTTP {e.code} for {path} (curl_err={curl_err}; target={_desensitized_host_port(url)}; proxy={_effective_proxy_host_port()})")
+    except Exception as e:
+        raise ApiError(f"{path}: curl failed: {curl_err}; urllib failed: {type(e).__name__}; target={_desensitized_host_port(url)}; proxy={_effective_proxy_host_port()}")
     if not body:
-        raise ApiError(f"{path}: empty response body")
+        raise ApiError(f"{path}: empty response body (curl_err={curl_err})")
     try:
         return json.loads(body.decode("utf-8"))
     except ValueError:
@@ -774,7 +874,12 @@ def aes_ecb_encrypt(plaintext, key):
     if not shutil.which("openssl"):
         raise ApiError("openssl not available for AES-ECB")
     cmd = ["openssl", "enc", "-aes-128-ecb", "-e", "-K", key.hex(), "-nosalt"]
-    r = subprocess.run(cmd, input=plaintext, capture_output=True, timeout=30)
+    try:
+        r = subprocess.run(cmd, input=plaintext, capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        # v1.0.1: TimeoutExpired str() contains the full argv incl. -K hex.
+        # Never let that exception object escape; raise a key-free ApiError.
+        raise ApiError("openssl encrypt timeout")
     if r.returncode != 0:
         raise ApiError(f"openssl encrypt failed: {r.stderr[:200]!r}")
     return r.stdout
@@ -787,7 +892,10 @@ def aes_ecb_decrypt(ciphertext, key):
     if not shutil.which("openssl"):
         raise ApiError("openssl not available for AES-ECB")
     cmd = ["openssl", "enc", "-aes-128-ecb", "-d", "-K", key.hex(), "-nosalt"]
-    r = subprocess.run(cmd, input=ciphertext, capture_output=True, timeout=30)
+    try:
+        r = subprocess.run(cmd, input=ciphertext, capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        raise ApiError("openssl decrypt timeout")
     if r.returncode != 0:
         raise ApiError(f"openssl decrypt failed (bad padding/key): {r.stderr[:200]!r}")
     return r.stdout
@@ -1456,7 +1564,16 @@ def send_image(session, image_path, to_user_id, context_token, client_id=None):
                    "-w", "%{http_code}", "-X", "POST",
                    "-H", "Content-Type: application/octet-stream",
                    "--data-binary", f"@{tmp_path}", upload_full_url]
-            r = subprocess.run(cmd, capture_output=True, timeout=40)
+            try:
+                r = subprocess.run(cmd, capture_output=True, timeout=40)
+            except subprocess.TimeoutExpired:
+                # v1.0.2: TimeoutExpired str() contains the full
+                # upload_full_url. Convert at the call site to a
+                # parameter-free RetryableError; upload is pre-send,
+                # so a retry (up to the drain limit) is safe.
+                raise RetryableError("upload curl timeout")
+            except Exception as e:
+                raise RetryableError(f"upload curl failed: {type(e).__name__}")
             http_code = (r.stdout or b"").decode().strip()
             try:
                 with open(hdr_path, encoding="utf-8", errors="ignore") as hf:
@@ -1485,7 +1602,8 @@ def send_image(session, image_path, to_user_id, context_token, client_id=None):
         except RetryableError:
             raise
         except Exception as e:
-            raise RetryableError(f"upload failed: {e}")
+            # v1.0.2: urllib error text can embed the upload URL.
+            raise RetryableError(f"upload failed: {type(e).__name__}")
         if not encrypt_param:
             raise RetryableError("upload failed: x-encrypted-param missing")
     aes_key_b64 = base64.b64encode(aeskey_hex.encode("utf-8")).decode()
@@ -1596,13 +1714,20 @@ def recover_sending_on_startup():
             continue
         if job.get("delivery_state") == "sending":
             job["delivery_state"] = "unknown_restart"
+            # v1.0.2: persist the terminal marker on disk BEFORE the
+            # move attempt, so a move failure + process restart still
+            # leaves a disk-recognisable terminal job (not just a
+            # memory set entry). Its text/attachment statuses stay
+            # 'pending' on purpose: the delivery result is unknown.
+            job["terminal"] = True
             job["needs_check_reason"] = "serve restarted with item in sending state"
             try:
                 atomic_write_json(path, job, mode=0o600)
                 os.replace(path, os.path.join(OUTBOX_FAILED, name))
                 print(f"outbox: recovered sending {name} -> failed/ needs_check (restart)", flush=True)
             except Exception as e:
-                print(f"outbox: recovery failed for {name}: {e}", flush=True)
+                _TERMINAL_TASK_IDS.add(name)
+                print(f"outbox: recovery failed for {name}: {_sanitize_error(e)}; marked terminal, will NOT resend", flush=True)
 
 
 def _classify_delivery_error(e):
@@ -1656,7 +1781,20 @@ def drain_outbox(session):
             with open(path, encoding="utf-8") as f:
                 job = json.load(f)
         except (OSError, ValueError) as e:
-            print(f"outbox: skipping unreadable {name}: {e}", flush=True)
+            print(f"outbox: skipping unreadable {name}: {_sanitize_error(e)}", flush=True)
+            continue
+        # v1.0.1 + v1.0.2: a job already at a terminal status must
+        # never be sent again, even if its earlier move to failed/
+        # failed and it is still sitting in pending/. A terminal job
+        # may only retry archiving, never re-enter sending.
+        if name in _TERMINAL_TASK_IDS or _is_terminal_job(job):
+            _TERMINAL_TASK_IDS.add(name)
+            failed_names.append(name)
+            try:
+                os.replace(path, os.path.join(OUTBOX_FAILED, name))
+                print(f"outbox: terminal {name} archived to failed/ on retry (no resend)", flush=True)
+            except OSError as e:
+                print(f"outbox: skipping terminal {name}, archive retry failed: {_sanitize_error(e)}; will NOT resend", flush=True)
             continue
         attachments = []
         if isinstance(job.get("attachments"), list):
@@ -1681,8 +1819,10 @@ def drain_outbox(session):
         for att in attachments:
             if isinstance(att, dict) and not att.get("client_id"):
                 att["client_id"] = uuid.uuid4().hex
-        # Text item.
-        if text and job.get("text_status") != "sent":
+        # Text item. v1.0.2 sub-item interception: a failed/needs_check
+        # text item is terminal on its own, even when other items in
+        # the same job are still pending.
+        if text and job.get("text_status") not in ("sent", "failed", "needs_check"):
             job["delivery_state"] = "sending"
             _state_ok = True
             try:
@@ -1706,19 +1846,20 @@ def drain_outbox(session):
                 status, _unknown = _classify_delivery_error(e)
                 job["text_status"] = status
                 job["delivery_state"] = status
-                job["text_error"] = str(e)[:500]
+                job["text_error"] = _sanitize_error(e)
                 if status == "pending":
                     job["text_attempts"] = int(job.get("text_attempts", 0)) + 1
                     if job["text_attempts"] >= 3:
                         job["text_status"] = "failed"
                         job["delivery_state"] = "failed"
                 changed = True
-                print(f"outbox: text {status} for {name}: {e}", flush=True)
+                print(f"outbox: text {status} for {name}: {_sanitize_error(e)}", flush=True)
         # Attachment items, each with its persisted client_id.
         for att in attachments:
             if not isinstance(att, dict):
                 continue
-            if att.get("status") == "sent":
+            # v1.0.2 sub-item interception, same rule as text above.
+            if att.get("status") in ("sent", "failed", "needs_check"):
                 continue
             att_path = att.get("path") or att.get("image_path")
             job["delivery_state"] = "sending"
@@ -1742,13 +1883,13 @@ def drain_outbox(session):
             except Exception as e:
                 status, _unknown = _classify_delivery_error(e)
                 att["status"] = status
-                att["error"] = str(e)[:500]
+                att["error"] = _sanitize_error(e)
                 if status == "pending":
                     att["attempts"] = int(att.get("attempts", 0)) + 1
                     if att["attempts"] >= 3:
                         att["status"] = "failed"
                 changed = True
-                print(f"outbox: image {status} for {name}: {e}", flush=True)
+                print(f"outbox: image {status} for {name}: {_sanitize_error(e)}", flush=True)
         if attachments:
             job["attachments"] = attachments
         all_sent = (not text or job.get("text_status") == "sent") and all(
@@ -1759,8 +1900,22 @@ def drain_outbox(session):
         if all_sent:
             job["delivery_state"] = "sent"
             changed = True
-        any_terminal = (text and job.get("text_status") in ("failed", "needs_check")) or any(
-            a.get("status") in ("failed", "needs_check") for a in attachments)
+        # v1.0.2 boundary fix (user review): do NOT archive on
+        # any_terminal alone. If one attachment is RetryableError
+        # (status pending, attempts < 3) and another is PermanentError
+        # (status failed), any_terminal is True, but archiving now
+        # would set terminal=True and move the whole job to failed/,
+        # losing the retryable item's remaining retries. Archive only
+        # when _is_terminal_job(job) is True, i.e. every sub-item is
+        # already sent/failed/needs_check and at least one is
+        # failed/needs_check. A still-pending sub-item keeps the job
+        # in pending/; the next drain skips the terminal sub-items
+        # (sub-item interception) and retries only the pending one.
+        # If "one permanent failure = whole job to manual handling"
+        # were the intended design, any_terminal would be enough;
+        # the chosen design is "retryable sub-items run out their
+        # 3 attempts first", which is also what drain_outbox's
+        # retryable-pending logic promises.
         _final_write_ok = True
         if changed:
             try:
@@ -1781,13 +1936,25 @@ def drain_outbox(session):
             os.replace(path, os.path.join(OUTBOX_SENT, name))
             sent_names.append(name)
             print(f"outbox: sent {name}", flush=True)
-        elif any_terminal:
+        elif _is_terminal_job(job):
+            # v1.0.1 + v1.0.2: mark terminal in-place first (text/att
+            # status are already failed/needs_check in the persisted
+            # job), persist job['terminal']=True on disk, then try to
+            # move. If the move itself fails, the next drain (even in
+            # a new process, after the memory set is cleared) still
+            # recognises the job as terminal from disk and never resends.
+            _TERMINAL_TASK_IDS.add(name)
+            job["terminal"] = True
+            try:
+                atomic_write_json(path, job, mode=0o600)
+            except Exception as e:
+                print(f"outbox: terminal flag write failed for {name}: {_sanitize_error(e)}", flush=True)
             try:
                 os.replace(path, os.path.join(OUTBOX_FAILED, name))
+                print(f"outbox: needs_check/failed {name} (moved to failed/, no auto-retry for unknown)", flush=True)
             except OSError as e:
-                print(f"outbox: failed move failed for {name}: {e}", flush=True)
+                print(f"outbox: failed move FAILED for {name}: {_sanitize_error(e)}; kept in pending but marked terminal, will NOT resend", flush=True)
             failed_names.append(name)
-            print(f"outbox: needs_check/failed {name} (moved to failed/, no auto-retry for unknown)", flush=True)
         else:
             failed_names.append(name)
             print(f"outbox: keeping {name} in pending (retryable, retry next loop)", flush=True)
@@ -1953,11 +2120,14 @@ def serve_loop():
             print("serve: token expired (-14), wrote NEEDS_RELOGIN, stopping.", flush=True)
             return 14
         except Exception as e:
-            print(f"serve: getupdates error, backing off 5s: {e}", flush=True)
+            # v1.0.2: post_json now carries curl_err + urllib_err +
+            # desensitized target/proxy; sanitise again as defence in depth.
+            print(f"serve: getupdates error, backing off 5s: {_sanitize_error(e)}", flush=True)
             time.sleep(5)
             continue
         new_cursor = resp.get("get_updates_buf")
         msgs = resp.get("msgs") or []
+        _batch_enqueue_failed = False
         for msg in msgs:
             # Private-chat + whitelist filter, exact case-sensitive compare.
             if msg.get("group_id"):
@@ -1991,12 +2161,21 @@ def serve_loop():
             # Phase 2 step 3: fast commands, direct reply, no inbox, no Worker.
             fast = fast_command_reply(text) if text else None
             if fast is not None:
+                # v1.0.1: send_direct_or_outbox returns False on queue
+                # write failure. Only then is it safe to mark processed.
+                # On failure, do NOT mark processed and do NOT advance
+                # the batch cursor (see batch end), so the next fetch
+                # retries this message instead of silently dropping it.
                 try:
-                    send_direct_or_outbox(session, fast, session.get("ilink_user_id"),
+                    _queued = send_direct_or_outbox(session, fast, session.get("ilink_user_id"),
                                           ctx, f"{mid}_fast.json")
                 except TokenExpired:
                     print("serve: token expired during fast reply, stopping.", flush=True)
                     return 14
+                if not _queued:
+                    _batch_enqueue_failed = True
+                    print(f"serve: fast reply queue FAILED for {mid}, NOT marking processed, will retry", flush=True)
+                    continue
                 processed.add(mid); save_processed(processed)
                 print(f"serve: fast reply for {mid}.json", flush=True)
                 continue
@@ -2004,12 +2183,16 @@ def serve_loop():
             # Explicit prompt, recorded as processed, never fabricated.
             if is_voice_only:
                 try:
-                    send_direct_or_outbox(
+                    _queued = send_direct_or_outbox(
                         session, "这条语音未收到微信端转写文字，请改发文字",
                         session.get("ilink_user_id"), ctx, f"{mid}_voice_prompt.json")
                 except TokenExpired:
                     print("serve: token expired during voice prompt, stopping.", flush=True)
                     return 14
+                if not _queued:
+                    _batch_enqueue_failed = True
+                    print(f"serve: voice prompt queue FAILED for {mid}, NOT marking processed, will retry", flush=True)
+                    continue
                 processed.add(mid); save_processed(processed)
                 print(f"serve: voice prompt for {mid}.json", flush=True)
                 continue
@@ -2062,12 +2245,16 @@ def serve_loop():
                 # so a failed image can be diagnosed after the fact.
                 print(f"serve: image fail for {mid}.json errors={image_errors}", flush=True)
                 try:
-                    send_direct_or_outbox(session, "图片接收失败，请重发",
+                    _queued = send_direct_or_outbox(session, "图片接收失败，请重发",
                                           session.get("ilink_user_id"), ctx,
                                           f"{mid}_image_fail.json")
                 except TokenExpired:
                     print("serve: token expired during image fail prompt, stopping.", flush=True)
                     return 14
+                if not _queued:
+                    _batch_enqueue_failed = True
+                    print(f"serve: image fail prompt queue FAILED for {mid}, NOT marking processed, will retry", flush=True)
+                    continue
                 processed.add(mid); save_processed(processed)
                 print(f"serve: image fail prompt for {mid}.json", flush=True)
                 continue
@@ -2101,7 +2288,12 @@ def serve_loop():
                             "status": "unavailable",
                             "reason": _ev.get("reason") or _ev.get("status"),
                         }
-            atomic_write_json(os.path.join(INBOX, f"{mid}.json"), record, mode=0o600)
+            try:
+                atomic_write_json(os.path.join(INBOX, f"{mid}.json"), record, mode=0o600)
+            except Exception as _inbox_e:
+                _batch_enqueue_failed = True
+                print(f"serve: inbox write FAILED for {mid}: {_sanitize_error(_inbox_e)}, NOT marking processed, will retry", flush=True)
+                continue
             processed.add(mid); save_processed(processed)
             print(f"serve: queued inbox/{mid}.json", flush=True)
             # Phase 2 step 3: typing + one queue notice only.
@@ -2129,7 +2321,12 @@ def serve_loop():
         # R2: only now, after the whole batch, advance the cursor
         # and persist the last context_token. A crash before this
         # point re-fetches the batch; processed messages deduplicate.
-        if new_cursor and new_cursor != cursor:
+        # v1.0.1: if any direct-reply/inbox enqueue in this batch
+        # failed, do NOT advance the cursor, so the failed message is
+        # re-fetched and retried instead of being silently dropped.
+        if _batch_enqueue_failed:
+            print("serve: batch enqueue failed, cursor NOT advanced, will re-fetch batch", flush=True)
+        elif new_cursor and new_cursor != cursor:
             save_cursor(new_cursor)
         try:
             save_session(session)
