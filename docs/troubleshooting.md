@@ -106,9 +106,19 @@
 - `NEEDS_RELOGIN` 存在：不要重启循环，必须重新登录。
 - `serve.pid` 存在但 `/proc` 无该进程：按架构文档的存活规则判断为死亡，不要用 `pgrep` 误判。
 
-## needs_check 人工处置（Gemini 补点）
-当 `outbox/failed/` 下出现 `needs_check` 文件时，管理员按以下步骤处理：
-1. 先在微信确认对方是否已收到该条回复；
-2. 若已收到，直接删除该文件，或移入 `outbox/sent/`；
-3. 若未收到，将其状态改回 `pending` 并移回 `outbox/pending/` 重新投递；
-4. 不要直接删除未确认的文件，也不要在未确认的情况下反复重发。
+## needs_check / 终态任务人工处置（Gemini 补点，v1.0.3 修正）
+
+> v1.0.3 之前这里的第 3 步是错的：只把状态改回 `pending` 并移回
+> `outbox/pending/`，**下轮仍会被拦住**，因为文件里还留着
+> `"terminal": true`，且当前 `serve` 进程内存里还有
+> `_TERMINAL_TASK_IDS` 集合。必须按下面 5 步走。
+
+当 `outbox/failed/` 下出现 `needs_check` / `terminal` 任务时，管理员按以下步骤处理：
+
+1. **先在微信确认对方是否已收到**：按子项逐个确认（文本、附件各算一项），不要整单笼统确认。
+2. **已收到的子项不动**：保持 `sent`，不要改回 `pending`；整单都已收到则删除该文件，或移入 `outbox/sent/`。
+3. **仅把确认未送达的子项改回 `pending`，字段名文本和附件不一样，别改错**：文本子项把顶层 `"text_status"` 改为 `"pending"`，且顶层 `"text_attempts"` 重置为 `0`；附件子项把 `attachments[i]` 里的 `"status"` 改为 `"pending"`，且该附件的 `"attempts"` 重置为 `0`；旧格式单图（只有 `image_path` / `image_status`，还没被归一化）把顶层 `"image_status"` 改为 `"pending"` 即可，归一化时重试计数从 0 起算。其他子项（`sent` / `failed` / `needs_check`）一律不动——`failed` / `needs_check` 子项下轮会被跳过，只重试 `pending` 子项。漏改 `text_attempts` 的后果：文本项原来已是 3 次，再失败一次就直接变 `failed`，等于只剩 1 次机会。
+4. **删掉整单的终态标记**：把文件顶层的 `"terminal": true` 删掉（或改为 `false`），再把文件从 `outbox/failed/` 移回 `outbox/pending/`。
+5. **重启 `serve`，或把重投文件改名**：当前进程内存中的 `_TERMINAL_TASK_IDS` 只认旧文件名，所以要么重启 `serve`（内存集合清空），要么把文件改名为新的 `<id>_retry.json` 再放回 `pending/`。改名的一个小副作用：`_sender_loop` 取消 typing 时用文件名去查 `_TYPING_MAP`，改名后查不到原票据；但走到人工重投时早过了几分钟，微信 typing 状态早已自然超时，无实际危害。**不要改 `_TERMINAL_TASK_IDS` 的拦截优先级**：它存在的唯一作用，是防止“留在 `pending/` 且移入 `failed/` 失败的终态任务”被重复发；磁盘上的任务一旦被人工修好（`_is_terminal_job(job)` 已为 `False`），重启 / 改名后就不会再被拦，逻辑最简单、最不容易引入新洞。
+
+**绝对不要做的事**：不要在未确认的情况下反复重发；不要把状态未知的子项（`unknown_restart`、或送达结果不明的 `needs_check`）直接改回 `pending` 重投——它可能已经送达，重投会造成重复消息。不要直接删除未确认的文件。
