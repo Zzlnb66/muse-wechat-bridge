@@ -413,9 +413,9 @@ def _post_via_curl(url, headers, data, timeout):
         # v1.0.2: TimeoutExpired str() contains the full argv, including
         # '-H', 'Authorization: Bearer <bot_token>' and the -d body.
         # Never embed the exception text; the type is the whole message.
-        raise ApiError("curl POST timeout")
+        raise ApiError("curl POST timeout") from None
     except Exception as e:
-        raise ApiError(f"curl POST failed: {type(e).__name__}")
+        raise ApiError(f"curl POST failed: {type(e).__name__}") from None
     if r.returncode != 0:
         raise ApiError(f"curl POST exit {r.returncode}")
     return r.stdout
@@ -431,9 +431,9 @@ def _get_via_curl(url, headers, timeout):
         r = subprocess.run(cmd, capture_output=True, timeout=int(timeout) + 10)
     except subprocess.TimeoutExpired:
         # v1.0.2: same rule as _post_via_curl; never embed argv text.
-        raise ApiError("curl GET timeout")
+        raise ApiError("curl GET timeout") from None
     except Exception as e:
-        raise ApiError(f"curl GET failed: {type(e).__name__}")
+        raise ApiError(f"curl GET failed: {type(e).__name__}") from None
     if r.returncode != 0:
         raise ApiError(f"curl GET exit {r.returncode}")
     return r.stdout
@@ -457,15 +457,51 @@ def _desensitized_host_port(value):
         return "none"
 
 
-def _effective_proxy_host_port():
+def _effective_proxy_host_port(target_url=None):
     """Proxy actually in effect for this process, host:port only.
     Checks https_proxy first (iLink is https), then http_proxy/all_proxy.
-    v1.0.2: never print the proxy URL itself (it may embed credentials)."""
+    v1.0.2: never print the proxy URL itself (it may embed credentials).
+    v1.0.3: if target_url is given and urllib.request.proxy_bypass(host)
+    is True, return "none (no_proxy bypass)" -- this matches urllib's
+    own bypass behaviour exactly (no_proxy/NO_PROXY, suffix, '*' and IP
+    matching), instead of misreporting a proxy that will not be used.
+    v1.0.3-final (P2): find a proxy FIRST, then apply the bypass check.
+    The old order returned "none (no_proxy bypass)" even when no proxy
+    was configured at all (e.g. NO_PROXY=* alone), which mislabels
+    "no proxy configured" as "bypassed". Now: no proxy -> "none"."""
+    proxy_hp = "none"
     for key in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
         value = os.environ.get(key)
         if value:
-            return _desensitized_host_port(value)
-    return "none"
+            proxy_hp = _desensitized_host_port(value)
+            break
+    if proxy_hp == "none":
+        return "none"
+    if target_url:
+        try:
+            host = urllib.parse.urlparse(target_url).hostname
+            if host and urllib.request.proxy_bypass(host):
+                return "none (no_proxy bypass)"
+        except Exception:
+            pass
+    return proxy_hp
+
+
+def _describe_urllib_error(e):
+    """v1.0.3: distinguish URLError causes without leaking the URL.
+    URLError's concrete cause is in e.reason, e.g. ConnectionRefusedError
+    (errno 111) vs TimeoutError. Recording only type(e).__name__ made
+    both look like "URLError". The reason string is sanitized, and the
+    request URL is never included."""
+    if isinstance(e, urllib.error.URLError):
+        reason = getattr(e, "reason", None)
+        if reason is not None:
+            if isinstance(reason, Exception):
+                return (f"URLError({type(reason).__name__}: "
+                        f"errno={getattr(reason, 'errno', None)}: "
+                        f"{_sanitize_error(reason)})")
+            return f"URLError(reason={_sanitize_error(reason)})"
+    return type(e).__name__
 
 
 def post_json(base, path, payload, session=None, authenticated=False, timeout=15, allow_fallback=True):
@@ -515,9 +551,9 @@ def post_json(base, path, payload, session=None, authenticated=False, timeout=15
         if isinstance(resp, dict) and (resp.get("ret") == -14 or resp.get("errcode") == -14):
             write_needs_relogin("http", f"HTTP {e.code} ret/errcode -14")
             raise TokenExpired(f"HTTP {e.code} with ret/errcode -14")
-        raise ApiError(f"HTTP {e.code} for {path}: {body[:500]!r} (curl_err={curl_err}; target={_desensitized_host_port(url)}; proxy={_effective_proxy_host_port()})")
+        raise ApiError(f"HTTP {e.code} for {path}: {body[:500]!r} (curl_err={curl_err}; target={_desensitized_host_port(url)}; proxy={_effective_proxy_host_port(url)})") from None
     except Exception as e:
-        raise ApiError(f"{path}: curl failed: {curl_err}; urllib failed: {type(e).__name__}; target={_desensitized_host_port(url)}; proxy={_effective_proxy_host_port()}")
+        raise ApiError(f"{path}: curl failed: {curl_err}; urllib failed: {_describe_urllib_error(e)}; target={_desensitized_host_port(url)}; proxy={_effective_proxy_host_port(url)}") from None
     if not body:
         raise ApiError(f"{path}: empty response body, not treated as success (curl_err={curl_err})")
     try:
@@ -552,9 +588,9 @@ def get_json(base, path, session=None, timeout=15):
         with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read()
     except urllib.error.HTTPError as e:
-        raise ApiError(f"HTTP {e.code} for {path} (curl_err={curl_err}; target={_desensitized_host_port(url)}; proxy={_effective_proxy_host_port()})")
+        raise ApiError(f"HTTP {e.code} for {path} (curl_err={curl_err}; target={_desensitized_host_port(url)}; proxy={_effective_proxy_host_port(url)})") from None
     except Exception as e:
-        raise ApiError(f"{path}: curl failed: {curl_err}; urllib failed: {type(e).__name__}; target={_desensitized_host_port(url)}; proxy={_effective_proxy_host_port()}")
+        raise ApiError(f"{path}: curl failed: {curl_err}; urllib failed: {_describe_urllib_error(e)}; target={_desensitized_host_port(url)}; proxy={_effective_proxy_host_port(url)}") from None
     if not body:
         raise ApiError(f"{path}: empty response body (curl_err={curl_err})")
     try:
@@ -879,7 +915,9 @@ def aes_ecb_encrypt(plaintext, key):
     except subprocess.TimeoutExpired:
         # v1.0.1: TimeoutExpired str() contains the full argv incl. -K hex.
         # Never let that exception object escape; raise a key-free ApiError.
-        raise ApiError("openssl encrypt timeout")
+        # v1.0.3: from None cuts the __context__ chain, so a traceback
+        # can never print the original TimeoutExpired argv.
+        raise ApiError("openssl encrypt timeout") from None
     if r.returncode != 0:
         raise ApiError(f"openssl encrypt failed: {r.stderr[:200]!r}")
     return r.stdout
@@ -895,7 +933,7 @@ def aes_ecb_decrypt(ciphertext, key):
     try:
         r = subprocess.run(cmd, input=ciphertext, capture_output=True, timeout=30)
     except subprocess.TimeoutExpired:
-        raise ApiError("openssl decrypt timeout")
+        raise ApiError("openssl decrypt timeout") from None
     if r.returncode != 0:
         raise ApiError(f"openssl decrypt failed (bad padding/key): {r.stderr[:200]!r}")
     return r.stdout
@@ -1571,9 +1609,9 @@ def send_image(session, image_path, to_user_id, context_token, client_id=None):
                 # upload_full_url. Convert at the call site to a
                 # parameter-free RetryableError; upload is pre-send,
                 # so a retry (up to the drain limit) is safe.
-                raise RetryableError("upload curl timeout")
+                raise RetryableError("upload curl timeout") from None
             except Exception as e:
-                raise RetryableError(f"upload curl failed: {type(e).__name__}")
+                raise RetryableError(f"upload curl failed: {type(e).__name__}") from None
             http_code = (r.stdout or b"").decode().strip()
             try:
                 with open(hdr_path, encoding="utf-8", errors="ignore") as hf:
@@ -1603,7 +1641,7 @@ def send_image(session, image_path, to_user_id, context_token, client_id=None):
             raise
         except Exception as e:
             # v1.0.2: urllib error text can embed the upload URL.
-            raise RetryableError(f"upload failed: {type(e).__name__}")
+            raise RetryableError(f"upload failed: {type(e).__name__}") from None
         if not encrypt_param:
             raise RetryableError("upload failed: x-encrypted-param missing")
     aes_key_b64 = base64.b64encode(aeskey_hex.encode("utf-8")).decode()
