@@ -1,0 +1,20 @@
+# R4 fix: ignore whole runtime state directories, not just individual files.
+# This covers session.json.tmp, login_pending.json.tmp, login_qr.png,
+# and any future .tmp files left by a crash.
+state/
+inbox/
+done/
+running/
+outbox/
+media/
+failures/
+secret_verify.txt
+login_qr.png
+__pycache__/
+.venv/
+*.log
+*.tmp
+*.tmp.*
+*.download.bin
+# Keep examples only (they are under examples/, not state/)
+!examples/
