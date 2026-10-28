@@ -1,8 +1,10 @@
 # 开源前修复说明（按审查编号逐项，独立副本）
 
-> 本目录是**独立修复副本**，不在正在运行的 `~/workspace/wechat-bridge/` 上修改。
-> 运行服务仍是 PID 26959 的旧版本；本修复版**没有**部署到运行服务，也**没有**重做微信实测。
-> 修复后需要先跑离线回归测试，再在测试环境做必要的微信实测，才能发布。
+> **当前状态说明（v1.0.1 补丁前置，读本文档先读这一段）：本文档是迭代修复过程记录，不是单次发布说明。**
+> - R1–R8 修复版：已于 2026-10-28 06:02 部署到运行服务（新进程 44402），并于 06:02–06:11 通过最小微信实测；下文“仍未部署 / 未重做实测”那几句是 05:41–06:01 独立副本阶段的历史说法，不要再拿它否定已部署的版本。
+> - v1.0.1 补丁（发图超时脱敏、/ping 入队失败、归档失败防重发，见文末）：目前只在本地修复副本里改完并跑通离线测试，**尚未部署到运行服务，也尚未做微信实测**，发布 v1.0.1 前必须先部署 + 最小微信实测。
+> - v1.0.2 补丁（Bearer 脱敏、磁盘终态识别、双路径错误日志，见文末）：目前只在本地修复副本里改完并跑通离线测试，**尚未部署到运行服务，也尚未做微信实测**，发布前必须先部署 + 最小微信实测（/ping、文本、单图、回传图）。
+> - 仓库已于 2026-10-28 发布到 GitHub（见 README.md），本文档的“未发布”说法同样是历史说法。
 
 ## R1：最终发送不再自动重发
 
@@ -104,3 +106,23 @@
 
 ## 最终 LICENSE（2026-10-28）
 - 作者选定自有代码许可证为 MIT，新增仓库根目录 LICENSE 文件（Copyright (c) 2026 ZZLNB），THIRD_PARTY_NOTICES.md 已同步更新，不再是“待选定”。
+
+## v1.0.1 补丁（GPT 故障注入反馈，2026-10-28，本地，未部署、未实机验证）
+
+- **问题 ① 发图加密超时密钥脱敏（已确认，修法有修正）**：原 `aes_ecb_encrypt/decrypt` 用 `subprocess.run(timeout=30)`，`TimeoutExpired` 的 str 里确实含完整 argv（含 `-K <hex>`）；原收图路径用了 `_sanitize_error`，但 `drain_outbox` 的图片/文本错误落盘用的是 `str(e)[:500]`，所以发图超时真的会把密钥写进 pending/failed 任务文件。GPT 说的 `CalledProcessError` 在本代码里不成立（没有 `check=True`，不会抛该异常），不要按那个修。修法：`aes_ecb_*` 捕获 `TimeoutExpired` 后直接抛不含密钥的 `ApiError("openssl ... timeout")`；`drain_outbox` 全部错误落盘与打印改用 `_sanitize_error(e)`。
+- **问题 ② /ping 入队失败仍推进游标（已确认）**：原 `serve_loop` 的 fast/voice/image-fail 分支忽略了 `send_direct_or_outbox` 的返回值（True/False），入队失败也照样 `processed.add`，批末游标照样前进，消息会被静默吞掉。修法：只有入队返回 True 才记 processed；入队失败设 `_batch_enqueue_failed`，批末不保存游标，下轮重取重试；普通 inbox 写失败也不再直接抛崩，改为同样不记 processed、批末不推进游标。
+- **问题 ③ 归档失败死循环重发（已确认，机制比 GPT 说的更具体）**：原 `drain_outbox` 的终态分支里 `os.replace` 到 failed/ 失败时只打印，文件仍留在 pending，且下轮 `text_status != "sent"` 会再次进入发送分支，确实会重发。修法：新增内存 `_TERMINAL_TASK_IDS` + `_is_terminal_job()`；终态分支先记终态、再尝试移动，移动失败也进终态集合；下轮 drain 开头凡是终态任务直接跳过，绝不调用发送接口；`recover_sending_on_startup` 恢复失败同样进终态集合。
+- **问题 ④ .gitignore 漏传（已确认，原因与 GPT 说的一致）**：本地修复副本里本来就有 `.gitignore`，GitHub 首次网页上传时因拖拽 `*` 不含隐藏文件而漏掉，不是本地没有。修法：GitHub 上用 Add file → Create new file 显式创建 `.gitignore`（内容与本地一致），不要只靠拖拽。
+- **问题 ⑤ 依赖与文档矛盾（部分确认，修法有修正）**：原 README 写“没有 requirements.txt，不要伪造”确实会让新用户不知道装什么，但不能把系统 openssl/curl 写进 pip 文件。修法：新增根目录 `requirements.txt`，只写 Pillow（运行时）+ qrcode（仅登录用），并注释 openssl/curl 为系统命令；README 快速开始改为 `pip install -r requirements.txt`；本文件顶部已加当前状态说明，消除“未部署/未发布”历史说法与 README 的冲突。
+- **测试**：新增 `tests/test_v101.py`（3 个离线模拟测试，全部 PASS）；原 `tests/test_regression.py` 的 R3 断言随 v1.0.1 行为同步更新（新行为是抛不含密钥的 ApiError，不再是原始 TimeoutExpired 对象）；`tests/test_r8_timing.py` 仍 PASS。真实微信实测尚未做，v1.0.1 不能写成已验证。
+
+## v1.0.2 补丁（用户对 v1.0.1 包的复核反馈，2026-10-28，本地，未部署、未实机验证）
+
+- **问题 ① Bearer 与上传 URL 脱敏（v1.0.1 遗漏，已确认）**：`_post_via_curl` / `_get_via_curl` 在 `subprocess.run` 抛异常时直接把 `e` 展开进 `ApiError`，`TimeoutExpired` 的 str 含完整 argv（含 `-H 'Authorization: Bearer <bot_token>'` 和 `-d` 请求体），外层 `_sanitize_error(e)` 此时已不是 TimeoutExpired 类型，且正则未覆盖 `Bearer\s+\S+`，所以 bot_token 会进日志和失败任务记录。`send_image` 第 1476 行附近的 CDN 上传 curl 也没有捕获 `TimeoutExpired`，超时后完整 `upload_full_url` 会逃逸到 `drain_outbox` 被判为 needs_check，而不是上传阶段本应归类的 RetryableError。修法：三处 curl 调用在调用位置捕获 `TimeoutExpired` 直接抛不含参数的安全错误（`ApiError("curl POST/GET timeout")` / `RetryableError("upload curl timeout")`），其他异常只保留 `type(e).__name__`；`_sanitize_error` 补上 `Bearer\s+[^\s'"]+` → `Bearer [redacted]`，以及 `"aeskey"` / `"context_token"` 的 JSON 字段脱敏。注意：不能用 `-pass stdin` 替换 `-K`，前者是派生密钥的口令，后者是原始密钥，替换会改变加密结果，本补丁没有这样改。
+- **问题 ② 磁盘终态识别（v1.0.1 只修了一半，已确认 + 1 处修正）**：`recover_sending_on_startup` 把中断任务写为 `delivery_state="unknown_restart"` 但未改 text/附件状态；`_is_terminal_job` 只看 text_status 和 attachments 的 status，不看 delivery_state，重启后会漏判。附件循环和文本分支也只排除了 `"sent"`，部分成功、部分 failed/needs_check 的任务在归档失败 + 重启后，失败子项会被再次发送。旧格式单图 `image_path` / `image_status` 也有同样问题：`_is_terminal_job` 在归一化之前被调用，且只读 `attachments`，没看 `image_path`。修法：`recover_sending_on_startup` 和 `drain_outbox` 的终态分支落盘前显式写顶层 `"terminal": True` 并持久化；`_is_terminal_job` 改为：`terminal is True` 或 `delivery_state == "unknown_restart"` 或（全部子项均处于 sent/failed/needs_check 且至少一项为 failed/needs_check）即为终态，`_terminal_attachments()` 同时覆盖旧格式 `image_path`；drain 入口遇到终态任务不再进入发送流程，只重试一次 `os.replace` 归档；文本分支改为 `text_status not in ("sent","failed","needs_check")` 才发，附件循环改为 `status in ("sent","failed","needs_check")` 就跳过。**对复核建议的一处修正**：复核建议里写 `delivery_state in ("failed","needs_check","unknown_restart")` 即为整单终态，但 drain 本身会把 delivery_state 写成最后一个子项的状态，所以“文本 failed + 附件 pending”的任务 delivery_state 就是 failed，却不是整单终态；按建议原样写会挡住那个 pending 附件。因此本补丁只把 `unknown_restart` 当作 delivery_state 层面的整单终态，failed/needs_check 的 delivery_state 仍走子项判定，这一冲突已用测试 2d 覆盖（failed 文本 + needs_check 附件不发，pending 附件照常发一次）。
+- **问题 ③ /ping 游标（v1.0.1 已完整修复，v1.0.2 不改）**：复核确认 serve_loop 在 /ping、语音提示、图片失败提示及普通 inbox 落盘失败时均不记 processed 并设 `_batch_enqueue_failed`，批末跳过游标保存；排队提示在 inbox 落盘并记完 processed 之后发送，失败不设批失败标志，不会触发 Worker 重复入队。逻辑严密，无需再改。
+- **问题 ④ Connection refused 双路径日志（已确认）**：`post_json` / `get_json` 在 allow_fallback=True 时 `except ApiError: pass` 直接吞掉了 curl 的退出码与错误原因，getupdates 失败时日志只打印回退后 urllib 的 `<urlopen error [Errno 111] Connection refused>`，无法区分 curl 当时报的是什么错。修法：保存 `curl_err`，urllib 也失败时抛出的 ApiError 同时记录 `curl_err` 与 `urllib_err`，以及脱敏后的目标 host:port 和当前生效代理 host:port（不含账密，见 `_desensitized_host_port` / `_effective_proxy_host_port`）；serve 的 getupdates 错误打印也改用 `_sanitize_error(e)` 再做一层防御。另两处纠正：不能说“80% 以上是本地代理”（无证据，只能说优先查代理是因为检查成本低）；`state/status_last.json` 的 `expired` 不能直接解释成运行会话失效（仓库没有生成该文件的代码，源码里 `status == "expired"` 是扫码二维码过期，运行会话失效走 -14 和 NEEDS_RELOGIN）。
+- **问题 ⑤ 陌生人复现文档与 README 同步（已确认）**：`cmd_status` 只输出 session、needs_relogin、inbox 数量、cursor 四项本地文件状态，不代表在线，README 已补注；README 新增“陌生人从零部署清单”：装依赖、本地扫码后人工上传 session.json（0600）、按模板配 Hook（5 秒轮询）与 Worker（原子写 outbox/pending，tmp + os.replace，0600）、启动与最小验收（/ping、文本、单图、回传图）。源码已自动创建队列目录、按脚本位置生成路径，这两点不再重复写成“修复”。README 目录里的旧 2337 行 / SHA 7cd359dd… 已同步为 v1.0.2 的 2534 行 / SHA 3535d58bfc5c210abbca2aca3c49b1a6ea16ba1fb6ee478ebb5eeeb75021fec7，并注明运行服务仍是 06:02 部署的 2337 行版。
+- **测试**：新增 `tests/test_v102.py`（Bearer 脱敏 + curl/upload 超时、unknown_restart / 全终态 / 旧格式 image_path 在清空内存集合模拟重启后仍不重发、子项拦截、双路径错误脱敏，全部 PASS）；`tests/test_v101.py`、`tests/test_regression.py`、`tests/test_r8_timing.py` 仍 PASS。真实微信实测尚未做，v1.0.2 不能写成已验证。
+
+- **v1.0.2 边界补修（用户复核，部署前）**：`drain_outbox` 原来用 `any_terminal`（任一子项 failed/needs_check）就把整单写 `terminal=True` 并移入 failed/，导致同单里 RetryableError 的子项（pending，attempts=1）失去剩下 2 次重试。修法：归档条件收紧为 `_is_terminal_job(job)`（全部子项已 sent/failed/needs_check 且至少一项 failed/needs_check）；只要还有子项 pending，就留在 pending/，下一轮子项拦截会跳过已终态子项、只重试 pending 子项。测试 `test_v102.py` 新增 2d/4：第一轮 retryable+permanent 后任务仍在 pending、terminal 未置、状态分别为 pending/failed；第二轮 pending 子项成功、failed 子项跳过，任务才归档到 failed/。本补丁后 bridge.py 为 2534 行，SHA 3535d58bfc5c210abbca2aca3c49b1a6ea16ba1fb6ee478ebb5eeeb75021fec7，README 已同步，仍未部署、未发布、未实测。
