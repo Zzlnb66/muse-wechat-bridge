@@ -133,7 +133,7 @@
 - **异常链切断**：6 处包装点全部加 `from None`：aes_ecb_encrypt / aes_ecb_decrypt 的 TimeoutExpired；_post_via_curl / _get_via_curl 的 TimeoutExpired 和通用异常；send_image CDN 上传 curl 的 TimeoutExpired 和通用异常；send_image CDN 上传 urllib 回退的通用异常。注意：`from None` 设置的是 `__suppress_context__ = True` / `__cause__ = None`，**不会把 `__context__` 清空**——断言 `__context__ is None` 对正确代码也会失败，正确断言是抑制标志 + 格式化堆栈里没有 "During handling of the above exception" 且没有密钥/URL。
 - **人工重投文档**：docs/troubleshooting.md 的 needs_check 处置已按 v1.0.3 修正为 5 步（逐子项确认未送达 → 仅该子项改 pending 且 attempts 重置为 0 → 删顶层 terminal → 移回 pending/ → 重启 serve 或改名 `<id>_retry.json` 以绕过内存 _TERMINAL_TASK_IDS）；不改 _TERMINAL_TASK_IDS 的拦截优先级，因为它只防“移入 failed/ 失败的终态任务”被重复发，磁盘修好后重启/改名即可，逻辑最简单。
 - **测试**：新增 tests/test_v103.py（urllib 原因区分 + NO_PROXY bypass + 6 处 traceback 脱敏，含 6 处调用点全覆盖）；v101、v102、原回归、R8 时序全部仍 PASS。
-- 本补丁后 bridge.py 为 2572 行，SHA d41d9b0d86df8377119c56c32715f81e31482b979ae731d78bef7fadf690fd57（v1.0.3 最终版，含下面 P1/P2/P3），README 已同步，仍未部署、未发布、未实测。
+- 本补丁后 bridge.py 为 2572 行，SHA d41d9b0d86df8377119c56c32715f81e31482b979ae731d78bef7fadf690fd57（v1.0.3 最终版，含下面 P1/P2/P3），README 已同步；2026-10-29 01:20 已部署，01:23-01:27 最小微信实测 4 项全部通过，Tag v1.0.3 已打。
 
 - **v1.0.3 最终版（P1/P2/P3，2026-10-29，新 Gemini 复核后）**：
   - P1（仅文档，不改 bridge.py 旧 SHA 之外的部分）：docs/troubleshooting.md 第 3 步和 README needs_check 段落已分开写清——文本子项改顶层 text_status 且 text_attempts 重置为 0，附件子项改 attachments[i].status 且 attempts 重置为 0，旧格式单图改顶层 image_status；漏改 text_attempts 的后果（只剩 1 次机会）已写明；改名重投的 typing 票据小副作用（改名后查不到原票据，但人工重投时 typing 早已超时，无实际危害）已注明。
