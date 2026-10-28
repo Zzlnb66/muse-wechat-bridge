@@ -102,7 +102,7 @@ python3 bridge.py serve
 
 ## 目录
 
-- `bridge.py`：可公开的完整桥接源码（2534 行，SHA-256 3535d58bfc5c210abbca2aca3c49b1a6ea16ba1fb6ee478ebb5eeeb75021fec7，v1.0.2 已部署并实测：2026-10-29 00:01 部署到运行服务（新 serve PID 7535），00:11-00:13 最小微信实测 4 项全部通过（/ping、普通文本、单图、回传图），GitHub 已打 Tag v1.0.2（见下）；此前运行服务是 2026-10-28 06:02 部署的 2337 行版，SHA-256 7cd359dd5ecbab4904f5cbea6f9bc153adae37a368a134dc4533df39175177ba）。
+- `bridge.py`：可公开的完整桥接源码（2572 行，SHA-256 d41d9b0d86df8377119c56c32715f81e31482b979ae731d78bef7fadf690fd57，v1.0.3 最终版本地修复副本（含 P1/P2/P3，见 FIX_NOTES），未部署、未发布、未做微信实测；v1.0.2 已部署并实测：2026-10-29 00:01 部署到运行服务（新 serve PID 7535），00:11-00:13 最小微信实测 4 项全部通过（/ping、普通文本、单图、回传图），GitHub 已打 Tag v1.0.2（见下）；此前运行服务是 2026-10-28 06:02 部署的 2337 行版，SHA-256 7cd359dd5ecbab4904f5cbea6f9bc153adae37a368a134dc4533df39175177ba）。
 - `examples/`：配置示例和脱敏请求结构示例。
 - `docs/architecture.md`：架构、组件、消息流、状态。
 - `docs/development-history.md`：路线、开发经过、关键修复。
@@ -112,7 +112,7 @@ python3 bridge.py serve
 - `.gitignore`：排除凭据、运行数据、日志、媒体、临时文件。
 
 ## needs_check 人工处置
-`outbox/failed/` 下出现 `needs_check` 文件时：先在微信确认对方是否已收到；已收到则删除或移入 `sent/`；未收到则改回 `pending` 并移回 `outbox/pending/` 重投；未确认前不要反复重发。详见 `docs/troubleshooting.md`。
+`outbox/failed/` 下出现 `needs_check` / 终态任务时：先按子项逐个在微信确认是否已收到；仅把确认未送达的子项改回 `pending`——文本子项改顶层 `"text_status"` 且 `"text_attempts"` 重置为 `0`，附件子项改 `attachments[i]` 里的 `"status"` 且 `"attempts"` 重置为 `0`，旧格式单图改顶层 `"image_status"`——删掉顶层 `"terminal": true`，移回 `outbox/pending/` 后重启 `serve` 或改名重投；未确认前不要反复重发。完整 5 步见 `docs/troubleshooting.md`。
 
 ## 账号安全表述
 走腾讯官方 iLink 授权通道，风险低于传统逆向外挂，但不承诺免受平台灰度规则变动影响，也不代表永久免责或零风险。
