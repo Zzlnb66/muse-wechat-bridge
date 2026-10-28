@@ -102,7 +102,7 @@ python3 bridge.py serve
 
 ## 目录
 
-- `bridge.py`：可公开的完整桥接源码（2534 行，SHA-256 3535d58bfc5c210abbca2aca3c49b1a6ea16ba1fb6ee478ebb5eeeb75021fec7，v1.0.2 本地修复副本，未部署、未发布、未做微信实测；运行服务仍是 2026-10-28 06:02 部署的 2337 行版，SHA-256 7cd359dd5ecbab4904f5cbea6f9bc153adae37a368a134dc4533df39175177ba）。
+- `bridge.py`：可公开的完整桥接源码（2534 行，SHA-256 3535d58bfc5c210abbca2aca3c49b1a6ea16ba1fb6ee478ebb5eeeb75021fec7，v1.0.2 已部署并实测：2026-10-29 00:01 部署到运行服务（新 serve PID 7535），00:11-00:13 最小微信实测 4 项全部通过（/ping、普通文本、单图、回传图），GitHub 已打 Tag v1.0.2（见下）；此前运行服务是 2026-10-28 06:02 部署的 2337 行版，SHA-256 7cd359dd5ecbab4904f5cbea6f9bc153adae37a368a134dc4533df39175177ba）。
 - `examples/`：配置示例和脱敏请求结构示例。
 - `docs/architecture.md`：架构、组件、消息流、状态。
 - `docs/development-history.md`：路线、开发经过、关键修复。
