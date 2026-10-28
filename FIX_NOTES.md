@@ -3,7 +3,7 @@
 > **当前状态说明（v1.0.1 补丁前置，读本文档先读这一段）：本文档是迭代修复过程记录，不是单次发布说明。**
 > - R1–R8 修复版：已于 2026-10-28 06:02 部署到运行服务（新进程 44402），并于 06:02–06:11 通过最小微信实测；下文“仍未部署 / 未重做实测”那几句是 05:41–06:01 独立副本阶段的历史说法，不要再拿它否定已部署的版本。
 > - v1.0.1 补丁（发图超时脱敏、/ping 入队失败、归档失败防重发，见文末）：目前只在本地修复副本里改完并跑通离线测试，**尚未部署到运行服务，也尚未做微信实测**，发布 v1.0.1 前必须先部署 + 最小微信实测。
-> - v1.0.2 补丁（Bearer 脱敏、磁盘终态识别、双路径错误日志，见文末）：目前只在本地修复副本里改完并跑通离线测试，**尚未部署到运行服务，也尚未做微信实测**，发布前必须先部署 + 最小微信实测（/ping、文本、单图、回传图）。
+> - v1.0.2 补丁（Bearer 脱敏、磁盘终态识别、双路径错误日志，见文末）：已于 2026-10-29 00:01 部署到运行服务（新 serve PID 7535，bridge.py 2534 行，SHA 3535d58b…），并于 00:11-00:13 通过最小微信实测 4 项（/ping 快捷回复、普通文本、单图接收与描述、回传小猫图，附件状态均为 sent），GitHub Tag v1.0.2 已打。
 > - 仓库已于 2026-10-28 发布到 GitHub（见 README.md），本文档的“未发布”说法同样是历史说法。
 
 ## R1：最终发送不再自动重发
@@ -125,4 +125,4 @@
 - **问题 ⑤ 陌生人复现文档与 README 同步（已确认）**：`cmd_status` 只输出 session、needs_relogin、inbox 数量、cursor 四项本地文件状态，不代表在线，README 已补注；README 新增“陌生人从零部署清单”：装依赖、本地扫码后人工上传 session.json（0600）、按模板配 Hook（5 秒轮询）与 Worker（原子写 outbox/pending，tmp + os.replace，0600）、启动与最小验收（/ping、文本、单图、回传图）。源码已自动创建队列目录、按脚本位置生成路径，这两点不再重复写成“修复”。README 目录里的旧 2337 行 / SHA 7cd359dd… 已同步为 v1.0.2 的 2534 行 / SHA 3535d58bfc5c210abbca2aca3c49b1a6ea16ba1fb6ee478ebb5eeeb75021fec7，并注明运行服务仍是 06:02 部署的 2337 行版。
 - **测试**：新增 `tests/test_v102.py`（Bearer 脱敏 + curl/upload 超时、unknown_restart / 全终态 / 旧格式 image_path 在清空内存集合模拟重启后仍不重发、子项拦截、双路径错误脱敏，全部 PASS）；`tests/test_v101.py`、`tests/test_regression.py`、`tests/test_r8_timing.py` 仍 PASS。真实微信实测尚未做，v1.0.2 不能写成已验证。
 
-- **v1.0.2 边界补修（用户复核，部署前）**：`drain_outbox` 原来用 `any_terminal`（任一子项 failed/needs_check）就把整单写 `terminal=True` 并移入 failed/，导致同单里 RetryableError 的子项（pending，attempts=1）失去剩下 2 次重试。修法：归档条件收紧为 `_is_terminal_job(job)`（全部子项已 sent/failed/needs_check 且至少一项 failed/needs_check）；只要还有子项 pending，就留在 pending/，下一轮子项拦截会跳过已终态子项、只重试 pending 子项。测试 `test_v102.py` 新增 2d/4：第一轮 retryable+permanent 后任务仍在 pending、terminal 未置、状态分别为 pending/failed；第二轮 pending 子项成功、failed 子项跳过，任务才归档到 failed/。本补丁后 bridge.py 为 2534 行，SHA 3535d58bfc5c210abbca2aca3c49b1a6ea16ba1fb6ee478ebb5eeeb75021fec7，README 已同步，仍未部署、未发布、未实测。
+- **v1.0.2 边界补修（用户复核，部署前）**：`drain_outbox` 原来用 `any_terminal`（任一子项 failed/needs_check）就把整单写 `terminal=True` 并移入 failed/，导致同单里 RetryableError 的子项（pending，attempts=1）失去剩下 2 次重试。修法：归档条件收紧为 `_is_terminal_job(job)`（全部子项已 sent/failed/needs_check 且至少一项 failed/needs_check）；只要还有子项 pending，就留在 pending/，下一轮子项拦截会跳过已终态子项、只重试 pending 子项。测试 `test_v102.py` 新增 2d/4：第一轮 retryable+permanent 后任务仍在 pending、terminal 未置、状态分别为 pending/failed；第二轮 pending 子项成功、failed 子项跳过，任务才归档到 failed/。本补丁后 bridge.py 为 2534 行，SHA 3535d58bfc5c210abbca2aca3c49b1a6ea16ba1fb6ee478ebb5eeeb75021fec7，README 已同步；2026-10-29 00:01 已部署，00:11-00:13 最小微信实测 4 项全部通过，Tag v1.0.2 已打。
