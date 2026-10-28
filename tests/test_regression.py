@@ -68,7 +68,11 @@ def test_r3_no_key_in_error(m, td):
         except Exception as e:
             s = m._sanitize_error(e)
             assert key.hex() not in s, s
-            assert s == "TimeoutExpired", s
+            # v1.0.1: aes_ecb_* now converts TimeoutExpired to a key-free
+            # ApiError ("openssl decrypt timeout") instead of letting the
+            # raw TimeoutExpired (argv incl. -K) escape; _sanitize_error
+            # on a raw TimeoutExpired still returns "TimeoutExpired".
+            assert "timeout" in s.lower(), s
     print("R3 TimeoutExpired sanitized, no key - PASS")
 
 def test_r4_tmp_permissions(m, td):
