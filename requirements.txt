@@ -1,0 +1,11 @@
+# Muse WeChat iLink bridge - Python dependencies.
+# Install: pip install -r requirements.txt
+# Notes:
+# - Pillow is a runtime dependency: full image decode (im.load()), not just header read.
+# - qrcode is LOGIN-ONLY: it renders login_qr.png in cmd_login. bridge.py serve
+#   itself does not import qrcode and does not need it at runtime.
+# - System openssl and curl are NOT pip packages and are NOT listed here;
+#   they must be present on the host (openssl for AES-128-ECB, curl for
+#   post_json/get_json transport and image curl fallback).
+Pillow
+qrcode
