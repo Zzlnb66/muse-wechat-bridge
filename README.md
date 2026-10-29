@@ -154,3 +154,10 @@ python3 bridge.py serve
 - 生产核验：bridge.py 新增 verify_channel_recovery() 与 `verify-channel` CLI（只读 JSON，永不抛异常、不比较时间字符串）；Worker 必须用该命令结果，不得手工拼字段判断。核验条件：serve.pid 存在且进程活着、cmdline 是 bridge.py serve、两文件均为对象、status ok、失败数 0（非布尔）、last_success 非空、process_pid 等于 serve.pid 等于 serve_run.pid、run_id 一致、boot_id 一致、proc_starttime 等于当前 /proc/<pid>/stat 第 22 字段、检查期间 PID 与启动时间不变。任一不满足只报未确认。
 - 诊断外逃：新增 _safe_warn()，警告输出单独用 try/except Exception 保护，不用 BaseException，不吞 SystemExit/KeyboardInterrupt；_record_channel_status 全程警告均走 _safe_warn，写入失败 + BrokenPipeError 组合失败仍返回不抛。
 - bridge.py 2880 行，SHA-256 89888b0443d044b9a05858d1e3fe0aab15d8711b4f3bf4b79422f1cc56e2468c；看门狗脚本未变，SHA-256 4f35eea90633ff20e721421634bf7045c762a5ef9b5c08e4a2421a9bf4550f58。
+
+## v1.0.4 部署与微信实测（2026-10-29）
+
+- 上传：2026-10-29 18:46 到 GitHub main，4 个提交 e3967a7（bridge.py、README.md、FIX_NOTES.md）、9882ed5（docs/troubleshooting.md 已与授权文件一致，0 file changed）、7ce8c2d（6 个新测试）、21f2e6f（watchdog/ 2 个新文件），仓库提交总数 25 -> 29。
+- 部署：2026-10-29 18:49-18:51，旧 v1.0.3（PID 1758，SHA d41d9b0d…）备份到 workspace/wechat-bridge-backup-20261029-pre-v104/ 后停掉；新 serve PID 18981，serve_run run_id 08b95f00ee10402db3aa2bc9ce29aeef，通道 pending -> ok 于 18:50:58，verify-channel recovered=true；session.json 未动，NEEDS_RELOGIN 不存在，inbox/pending 为空；一次并发重启尝试被 flock 挡回，未双跑。
+- 微信实测（部署后真实消息）：/ping 快速回复“桥接在线，serve 正常”（18:55:41，快速通道不进 done/）；普通文字、用户图片、生成花枝鼠形象并回图，4 条全部有回复；19:02:14 verify-channel 仍 ok，19:04:53 最近一次成功。
+- Tag v1.0.4 随后在 GitHub Releases 创建，指向本次文档提交。
