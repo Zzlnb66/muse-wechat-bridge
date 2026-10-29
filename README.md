@@ -116,3 +116,41 @@ python3 bridge.py serve
 
 ## 账号安全表述
 走腾讯官方 iLink 授权通道，风险低于传统逆向外挂，但不承诺免受平台灰度规则变动影响，也不代表永久免责或零风险。
+
+
+## v1.0.4（P0 收敛版，2026-10-29，仅供独立复核，尚未部署、尚未打 Tag）
+
+- 范围只限三项：(1) 同一掉线事件去重 + 过期唤醒处理；(2) 时间戳与现场快照；(3) 进程与通道分开报告。另附两个针对性回归测试。
+- 不包含：并发启动新增锁（已证伪，唯一 PID 写入点在 flock 成功之后，失败启动者绝不写 PID，见 tests/test_v104.py）；网络根因定位（单独验证，不以“网络错误消失”作为 v1.0.4 验收目标）。
+- bridge.py 2625 行，SHA-256 f4aa1946619ececeff9afb09b806a0fdb9a612b305d075d092aa5a8947b810ea。
+- 看门狗脚本 watchdog/wechat-bridge-watchdog.sh（部署时覆盖 ~/hooks/scripts/wechat-bridge-watchdog.sh），复核补丁后 235 行，SHA-256 3ed45aa79fc532d7d3d9018cabe11daea8a90731b2a8311d46523e5d9cc30897。
+- 看门狗定义 ~/hooks/definitions/wechat-bridge-watchdog.json 的 Worker 提示词已补进程/通道分开报告与过期唤醒规则（部署时同步更新，哈希以部署后实测为准，不在本文档冒充）。
+- 验收目标：消除重复误导、留下可定位证据。连续缺席 90 秒只产生一次初始唤醒；长期未恢复每 300 秒重试一次；恢复后到达的旧事件不重复通知；inbox_new 正常触发；进程已启动但请求仍失败时只报“进程已恢复，通道待确认”，有效 getupdates 响应（含成功空响应）才确认通道恢复。
+- 测试：test_v104.py、test_v104_watchdog.sh 全部通过，v101/v102/v103/regression/r8_timing 全部通过。部署前必须经独立复核通过，再按“上传 -> 部署 -> 微信实测 -> 打 Tag”走。
+
+## v1.0.4 复核补丁（2026-10-29，独立复核暂不通过后退回修改，仍未部署、未打 Tag）
+
+- 发现 1：serve 获锁后立即生成 run_id，先写 state/serve_run.json 和 pending 的 channel_status，再写 serve.pid；Worker 确认通道恢复必须同时满足 status ok、失败数 0、process_pid 等于当前 serve.pid、run_id 等于 serve_run.run_id、last_success_ts 不为空且不早于 process_started_ts，删除 ok/0 兜底。
+- 发现 2：看门狗统一快照，快照在 wake/silent 之前记录，全部终止分支携带 checked_at、serve_running、pid、check_reason、proc_exists、cmdline_first、boot_id、event_id、wake_kind、new_inbox、seconds_since_last_wake、needs_relogin，PID 字段统一为 pid。
+- 发现 3：首次/重试掉线同时有 inbox 时，先把该批文件记入 seen 再唤醒，下一 tick 不再把它当新文件。
+- 发现 4：channel_status 字段类型异常时诊断函数不抛异常、不导致 serve 退出，失败数重置为 0 并打印可见警告；写入失败也打印警告。
+- 另修：看门狗 mark_seen 在空 inbox 时不再因 grep 空输入 + pipefail + set -e 导致脚本静默退出，该问题由更新后的看门狗测试发现。
+- 旧包（bridge.py SHA f4aa1946…、看门狗 SHA ae0a3540…）已作废，以复核补丁后的哈希为准。
+
+
+> **最新规则声明（部署时只用这一段，历史段已取代）：** Worker 通道确认必须用生产命令 `python3 bridge.py verify-channel` 的 JSON 结果，禁止用 `last_success_ts >= process_started_ts` 的字符串时间比较；初始化失败即启动失败（返回 1，不写 serve.pid）；未消费 inbox 按最后唤醒时间 300 秒重提醒。README 历史段中任何旧时间比较规则、旧哈希均已作废，不得照抄部署。
+
+## v1.0.4 GPT 裁决补丁（2026-10-29，GPT 裁决后，仍未部署、未打 Tag）
+
+- 裁决结论：暂不放行，修好两项阻断并跑通故障注入后才放行。旧复核补丁包（0060e51e…）已作废，以本节哈希为准。
+- 阻断 1：初始化失败即启动失败，不写 serve.pid，返回 1（不是 -14 token 过期）；serve_run.json 增加 boot_id 与 /proc/self/stat 第 22 字段 proc_starttime；Worker 删除 last_success_ts 时间比较，改内核启动时间 + run_id 匹配；初始化失败或进程未运行时报“启动失败/进程未运行，通道未确认”，只有确认当前进程运行时才说“进程已恢复，通道待确认”。
+- 阻断 2：未消费 inbox 按最后唤醒时间 300 秒重提醒；只有实际发出唤醒时才刷新 last_wake_ms，被抑制的 tick 不顺延；文件离开 inbox 后清理提醒记录；serve_down 与 inbox 重试分别管理，进程恢复不取消未消费文件的重提醒。重复调度由 Worker 按 message_id 去重，不重复发用户通知。
+- 非阻断：运行期诊断更新失败仍只警告继续；日志格式、统计等后续迭代。
+- bridge.py 2757 行，SHA-256 f0a94d564d780924c9af088a7efc3d534a21a61fff58b245a244ebb4b418fd36；看门狗脚本 264 行，SHA-256 4f35eea90633ff20e721421634bf7045c762a5ef9b5c08e4a2421a9bf4550f58。
+
+## v1.0.4 复核第二轮补丁（2026-10-29，仍未部署、未打 Tag）
+
+- 本轮不推翻 GPT 裁决补丁，只补两项阻断验收：生产 Worker 核验端到端覆盖、诊断警告外逃修复、299 秒测试直接断言。
+- 生产核验：bridge.py 新增 verify_channel_recovery() 与 `verify-channel` CLI（只读 JSON，永不抛异常、不比较时间字符串）；Worker 必须用该命令结果，不得手工拼字段判断。核验条件：serve.pid 存在且进程活着、cmdline 是 bridge.py serve、两文件均为对象、status ok、失败数 0（非布尔）、last_success 非空、process_pid 等于 serve.pid 等于 serve_run.pid、run_id 一致、boot_id 一致、proc_starttime 等于当前 /proc/<pid>/stat 第 22 字段、检查期间 PID 与启动时间不变。任一不满足只报未确认。
+- 诊断外逃：新增 _safe_warn()，警告输出单独用 try/except Exception 保护，不用 BaseException，不吞 SystemExit/KeyboardInterrupt；_record_channel_status 全程警告均走 _safe_warn，写入失败 + BrokenPipeError 组合失败仍返回不抛。
+- bridge.py 2880 行，SHA-256 89888b0443d044b9a05858d1e3fe0aab15d8711b4f3bf4b79422f1cc56e2468c；看门狗脚本未变，SHA-256 4f35eea90633ff20e721421634bf7045c762a5ef9b5c08e4a2421a9bf4550f58。

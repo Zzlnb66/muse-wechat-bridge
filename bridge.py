@@ -309,6 +309,195 @@ def atomic_write_text(path, text, mode=0o600):
         pass
 
 
+def _now_iso():
+    """v1.0.4: local ISO timestamp with timezone, for serve.log lines
+    and channel_status.json, so tick -> Worker check -> process start
+    -> request result can be correlated. No secrets are ever in it."""
+    import datetime as _dt
+    return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _log_ts(msg):
+    """v1.0.4: timestamped serve log line. Existing substrings
+    (e.g. "lock acquired", "getupdates error", "queued inbox/") are
+    preserved after the timestamp, so old log grep patterns still work."""
+    print(f"{_now_iso()} {msg}", flush=True)
+
+
+CHANNEL_STATUS_FILE = os.path.join(STATE, "channel_status.json")
+SERVE_RUN_FILE = os.path.join(STATE, "serve_run.json")
+# v1.0.4 review fix (Finding 1): instance identity for the current
+# serve process. A new run_id is generated after flock succeeds, so
+# even a reused PID cannot make an old instance's success look like
+# the current instance's success. The Worker must require
+# channel_status.run_id == serve_run.run_id, not just ok/0.
+_RUN_ID = None
+_PROCESS_STARTED_TS = None
+
+
+def _boot_id():
+    """GPT ruling: system boot identity, from /proc/sys/kernel/random/boot_id."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="utf-8") as f:
+            v = f.read().strip()
+            return v or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _proc_starttime(pid=None):
+    """GPT ruling: kernel process starttime, field 22 of /proc/<pid>/stat
+    (jiffies since boot). Parses after the LAST ')' so a comm containing
+    spaces or parentheses cannot shift the field count. Returns None
+    when the process cannot be read (dead / different namespace)."""
+    try:
+        path = f"/proc/{pid or os.getpid()}/stat"
+        with open(path, encoding="utf-8") as f:
+            data = f.read()
+        rparen = data.rfind(")")
+        if rparen < 0:
+            return None
+        rest = data[rparen + 2:].split()
+        # rest[0] is field 3 (state); field 22 is rest[19].
+        if len(rest) <= 19:
+            return None
+        return int(rest[19])
+    except Exception:
+        return None
+
+
+def _init_channel_status():
+    """GPT ruling (blocking): startup identity establishment, STRONG
+    constraint. Called immediately after flock succeeds, BEFORE
+    serve.pid is written. Raises on ANY necessary write failure;
+    serve_loop must catch it, return non-zero, and NEVER write
+    serve.pid. The previous docstring ("diagnostic write failure
+    must not stop serve") is superseded: that policy applies ONLY
+    to runtime _record_channel_status updates, never to init.
+    Writes serve_run.json (run_id, pid, boot_id, proc_starttime)
+    and pending channel_status.json, each atomically. A partial
+    state (one file new, one old) is a normal unconfirmed state:
+    the Worker must treat identity mismatch / missing file as
+    channel unconfirmed, never as recovery."""
+    global _RUN_ID, _PROCESS_STARTED_TS
+    import uuid as _uuid
+    _RUN_ID = _uuid.uuid4().hex
+    _PROCESS_STARTED_TS = _now_iso()
+    boot = _boot_id()
+    starttime = _proc_starttime()
+    run_obj = {"run_id": _RUN_ID, "pid": os.getpid(),
+               "started_ts": _PROCESS_STARTED_TS,
+               "boot_id": boot, "proc_starttime": starttime}
+    obj = {
+        "status": "pending",
+        "last_attempt_ts": _PROCESS_STARTED_TS,
+        "last_success_ts": None,
+        "consecutive_failures": 0,
+        "last_error": None,
+        "process_pid": os.getpid(),
+        "run_id": _RUN_ID,
+        "process_started_ts": _PROCESS_STARTED_TS,
+        "boot_id": boot,
+        "proc_starttime": starttime,
+    }
+    # No try/except swallow here: atomic_write_json raising means
+    # init failed, and serve_loop must abort startup.
+    atomic_write_json(SERVE_RUN_FILE, run_obj, mode=0o600)
+    atomic_write_json(CHANNEL_STATUS_FILE, obj, mode=0o600)
+    return obj
+
+
+def _safe_warn(msg):
+    """Review fix (diagnostic escape): warning output with its OWN
+    try/except Exception guard. BrokenPipeError and OSError are
+    already Exception subclasses, so except Exception is sufficient.
+    NEVER use BaseException here: that would swallow SystemExit
+    and KeyboardInterrupt. If the warning itself cannot be printed,
+    it is silently dropped, and the caller still returns normally."""
+    try:
+        print(msg, flush=True)
+    except Exception:
+        pass
+
+
+def _record_channel_status(ok, error_text=None):
+    """v1.0.4: separate channel status from process liveness.
+    Written atomically after every getupdates attempt (success or
+    failure). Fields: status ok/error/pending, last_success_ts,
+    last_attempt_ts, consecutive_failures, last_error (desensitized,
+    truncated, never a URL/token), process_pid, run_id,
+    process_started_ts. A successful EMPTY getupdates response
+    counts as success: it proves the API answered, even when there
+    are no new messages. No new message is NOT channel failure.
+    Callers must NOT use this file as a login-validity signal:
+    login validity is NEEDS_RELOGIN / ret -14 only.
+    GPT ruling: runtime updates are the WEAK constraint (warn and
+    continue on write failure), unlike _init_channel_status, which
+    is the STRONG constraint (fail startup).
+    Review fix (Finding 4): this function NEVER raises. A prev file
+    that is valid JSON but has a wrong-typed field (e.g.
+    consecutive_failures as a string) is reset to a safe default
+    with a visible warning, instead of turning a retryable network
+    failure into a serve_loop exit. A write failure is also a
+    visible warning, not a silent swallow and not an exit."""
+    try:
+        prev = {}
+        if os.path.exists(CHANNEL_STATUS_FILE):
+            with open(CHANNEL_STATUS_FILE, encoding="utf-8") as f:
+                prev = json.load(f) or {}
+        if not isinstance(prev, dict):
+            _safe_warn("serve: warning, channel_status not an object, resetting to defaults")
+            prev = {}
+        raw_failures = prev.get("consecutive_failures", 0)
+        if isinstance(raw_failures, bool) or not isinstance(raw_failures, int) or raw_failures < 0:
+            _safe_warn(f"serve: warning, channel_status consecutive_failures invalid ({raw_failures!r}), resetting to 0")
+            raw_failures = 0
+        prev_success = prev.get("last_success_ts")
+        if prev_success is not None and not isinstance(prev_success, str):
+            prev_success = None
+        prev_run = prev.get("run_id")
+        if prev_run is not None and not isinstance(prev_run, str):
+            prev_run = None
+        prev_started = prev.get("process_started_ts")
+        if prev_started is not None and not isinstance(prev_started, str):
+            prev_started = None
+        failures = 0 if ok else raw_failures + 1
+        obj = {
+            "status": "ok" if ok else "error",
+            "last_attempt_ts": _now_iso(),
+            "last_success_ts": _now_iso() if ok else prev_success,
+            "consecutive_failures": failures,
+            "last_error": None if ok else (_sanitize_error(error_text) if error_text else "unknown"),
+            "process_pid": os.getpid(),
+            "run_id": _RUN_ID if _RUN_ID is not None else prev_run,
+            "process_started_ts": _PROCESS_STARTED_TS if _PROCESS_STARTED_TS is not None else prev_started,
+            "boot_id": _boot_id(),
+            "proc_starttime": _proc_starttime(),
+        }
+        try:
+            atomic_write_json(CHANNEL_STATUS_FILE, obj, mode=0o600)
+        except Exception as e:
+            _safe_warn(f"serve: warning, channel_status write failed: {e}")
+        return obj
+    except Exception as e:
+        # Last-resort guard: diagnostics must never kill serve.
+        # The warning itself uses _safe_warn, so a broken stdout
+        # pipe cannot turn this guard into a second escape.
+        _safe_warn(f"serve: warning, channel_status update failed (diagnostics only): {e}")
+        return {
+            "status": "ok" if ok else "error",
+            "last_attempt_ts": _now_iso(),
+            "last_success_ts": _now_iso() if ok else None,
+            "consecutive_failures": 0 if ok else 1,
+            "last_error": None if ok else "diagnostics_failed",
+            "process_pid": os.getpid(),
+            "run_id": _RUN_ID,
+            "process_started_ts": _PROCESS_STARTED_TS,
+            "boot_id": _boot_id(),
+            "proc_starttime": _proc_starttime(),
+        }
+
+
 def load_session():
     with _SESSION_LOCK:
         if not os.path.exists(SESSION_FILE):
@@ -2080,7 +2269,16 @@ def serve_loop():
             msvcrt.locking(lock_f.fileno(), msvcrt.LK_NBLCK, 1)
         except Exception:
             print("serve: warning, no file lock on Windows, make sure only one serve runs.", flush=True)
-    print("serve: lock acquired, polling. Ctrl-C to stop.", flush=True)
+    # GPT ruling (blocking): instance identity BEFORE the PID file
+    # points at this process. If init fails, abort startup with a
+    # non-zero code and NEVER write serve.pid. Do NOT treat this as
+    # token expiry (-14 / NEEDS_RELOGIN).
+    try:
+        _init_channel_status()
+    except Exception as _init_e:
+        _safe_warn(f"serve: FATAL, channel identity init failed, aborting startup (no serve.pid written): {_init_e}")
+        return 1
+    _log_ts(f"serve: lock acquired, polling. Ctrl-C to stop. pid={os.getpid()}")
     # Step 1: PID file so the watchdog hook can check liveness without
     # matching its own shell command line. A stale PID file alone is
     # NOT proof of life; the hook must also kill -0 the PID.
@@ -2154,13 +2352,15 @@ def serve_loop():
                 timeout=45,
             )
             check_ret(resp, "getupdates")
+            _record_channel_status(True)
         except TokenExpired:
             print("serve: token expired (-14), wrote NEEDS_RELOGIN, stopping.", flush=True)
             return 14
         except Exception as e:
             # v1.0.2: post_json now carries curl_err + urllib_err +
             # desensitized target/proxy; sanitise again as defence in depth.
-            print(f"serve: getupdates error, backing off 5s: {_sanitize_error(e)}", flush=True)
+            _record_channel_status(False, _sanitize_error(e))
+            _log_ts(f"serve: getupdates error, backing off 5s: {_sanitize_error(e)}")
             time.sleep(5)
             continue
         new_cursor = resp.get("get_updates_buf")
@@ -2333,7 +2533,7 @@ def serve_loop():
                 print(f"serve: inbox write FAILED for {mid}: {_sanitize_error(_inbox_e)}, NOT marking processed, will retry", flush=True)
                 continue
             processed.add(mid); save_processed(processed)
-            print(f"serve: queued inbox/{mid}.json", flush=True)
+            _log_ts(f"serve: queued inbox/{mid}.json")
             # Phase 2 step 3: typing + one queue notice only.
             # Do NOT claim Muse has started executing before Worker runs.
             try:
@@ -2518,6 +2718,111 @@ def cmd_login(args):
     return 2
 
 
+def verify_channel_recovery():
+    """Production Worker verification (GPT ruling, blocking).
+    This is the ONLY channel-recovery check the Worker should use:
+    `python3 bridge.py verify-channel` prints this dict as JSON.
+    Read-only: it never writes, never sends, never restarts serve.
+    It NEVER raises and NEVER compares ISO timestamp strings.
+    Recovery is confirmed only when ALL hold at check time:
+      - serve.pid exists, parses, and the process is alive with a
+        python bridge.py serve cmdline;
+      - serve_run.json and channel_status.json exist and are objects;
+      - channel_status.status == "ok", consecutive_failures == 0
+        (int, not bool), last_success_ts is not None;
+      - process_pid (channel) == serve.pid == serve_run.pid;
+      - run_id matches between the two files;
+      - boot_id matches the current boot_id, and proc_starttime
+        matches the current /proc/<pid>/stat field 22, in BOTH files
+        (old files without these fields are unconfirmed, not ok);
+      - serve.pid and proc_starttime do not change during the check.
+    Any missing file, mismatch, unreadable identity, dead process,
+    or checker error -> recovered False, with a reason. Time
+    strings are returned for human readability only, never used
+    as a logic switch."""
+    def _unconfirmed(reason, extra=None):
+        out = {"recovered": False, "reason": reason}
+        if extra:
+            out.update(extra)
+        return out
+    try:
+        pid_path = os.path.join(STATE, "serve.pid")
+        if not os.path.exists(pid_path):
+            return _unconfirmed("pid_missing")
+        try:
+            with open(pid_path, encoding="utf-8") as f:
+                pid_text = f.read().strip()
+        except Exception:
+            return _unconfirmed("pid_unreadable")
+        if not pid_text:
+            return _unconfirmed("pid_empty")
+        try:
+            pid = int(pid_text)
+        except Exception:
+            return _unconfirmed("pid_invalid")
+        # Process alive + cmdline, read-only.
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read().replace(b"\x00", b" ").decode(errors="ignore")
+        except Exception:
+            return _unconfirmed("process_not_running", {"pid": pid})
+        if "bridge.py" not in cmdline or "serve" not in cmdline:
+            return _unconfirmed("process_cmdline_mismatch", {"pid": pid})
+        try:
+            os.kill(pid, 0)
+        except Exception:
+            return _unconfirmed("process_not_running", {"pid": pid})
+        cur_boot = _boot_id()
+        cur_start = _proc_starttime(pid)
+        if cur_start is None:
+            return _unconfirmed("kernel_identity_unavailable", {"pid": pid})
+        try:
+            with open(SERVE_RUN_FILE, encoding="utf-8") as f:
+                run = json.load(f)
+            with open(CHANNEL_STATUS_FILE, encoding="utf-8") as f:
+                chan = json.load(f)
+        except Exception:
+            return _unconfirmed("identity_file_missing_or_invalid", {"pid": pid})
+        if not isinstance(run, dict) or not isinstance(chan, dict):
+            return _unconfirmed("identity_file_not_object", {"pid": pid})
+        run_id = run.get("run_id")
+        if not run_id or chan.get("run_id") != run_id:
+            return _unconfirmed("run_id_mismatch", {"pid": pid})
+        if run.get("pid") != pid or chan.get("process_pid") != pid:
+            return _unconfirmed("pid_mismatch", {"pid": pid})
+        if run.get("boot_id") != cur_boot or chan.get("boot_id") != cur_boot:
+            return _unconfirmed("boot_id_mismatch", {"pid": pid})
+        if run.get("proc_starttime") != cur_start or chan.get("proc_starttime") != cur_start:
+            return _unconfirmed("proc_starttime_mismatch", {"pid": pid})
+        if chan.get("status") != "ok":
+            return _unconfirmed("channel_not_ok", {"pid": pid, "status": chan.get("status")})
+        failures = chan.get("consecutive_failures")
+        if isinstance(failures, bool) or not isinstance(failures, int) or failures != 0:
+            return _unconfirmed("channel_failures_not_zero", {"pid": pid})
+        if chan.get("last_success_ts") is None:
+            return _unconfirmed("channel_pending", {"pid": pid})
+        # Identity must not change during the check.
+        try:
+            with open(pid_path, encoding="utf-8") as f:
+                pid_text2 = f.read().strip()
+            start2 = _proc_starttime(pid)
+        except Exception:
+            return _unconfirmed("identity_changed_during_check", {"pid": pid})
+        if pid_text2 != pid_text or start2 != cur_start:
+            return _unconfirmed("identity_changed_during_check", {"pid": pid})
+        return {"recovered": True, "reason": "ok", "pid": pid, "run_id": run_id,
+                "status": chan.get("status"), "last_success_ts": chan.get("last_success_ts")}
+    except Exception as e:
+        # Checker errors are unconfirmed, never a crash and never recovery.
+        return _unconfirmed("checker_error", {"error_type": type(e).__name__})
+
+
+def cmd_verify_channel(_args):
+    result = verify_channel_recovery()
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result.get("recovered") else 1
+
+
 def cmd_status(_args):
     ensure_dirs()
     session = load_session()
@@ -2542,6 +2847,7 @@ def main(argv=None):
     p_send.add_argument("--context-token", default=None)
     p_send.add_argument("--client-id", default=None)
     sub.add_parser("status", help="Show bridge state without printing secrets")
+    sub.add_parser("verify-channel", help="Production Worker channel-recovery check (read-only JSON, exit 0 only if recovered)")
     args = parser.parse_args(argv)
     ensure_dirs()
     if args.cmd == "login":
@@ -2550,6 +2856,8 @@ def main(argv=None):
         return serve_loop()
     if args.cmd == "status":
         return cmd_status(args)
+    if args.cmd == "verify-channel":
+        return cmd_verify_channel(args)
     if args.cmd == "send":
         session = load_session()
         if not session:

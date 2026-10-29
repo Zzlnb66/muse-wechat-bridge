@@ -140,3 +140,43 @@
   - P2（改代码）：_effective_proxy_host_port 改为先找代理、无代理直接返回 "none"，有代理且命中 proxy_bypass 才返回 "none (no_proxy bypass)"；test_v103.py 补了无代理 + NO_PROXY=* 时返回 "none" 的用例。
   - P3（改代码）：post_json / get_json 的 4 处双路径 ApiError 汇总报错（HTTPError 和通用异常各 2 处）全部加 from None，使汇总错误本身的堆栈也干净；TokenExpired 的控制流信号未动。
   - 最终版 bridge.py 为 2572 行，SHA d41d9b0d86df8377119c56c32715f81e31482b979ae731d78bef7fadf690fd57，5 套测试全部仍 PASS，复核包为 11 个文件（上一版说明误写 12 个，已更正）。
+
+
+## v1.0.4 P0 收敛版（2026-10-29，独立复核中，尚未部署）
+
+- 去重：看门狗 hook state 增加 serve_down_event（event_id、boot_id、first_seen_ms、last_wake_ms、wake_count、last_reason），同一掉线只初始唤醒一次，300 秒后重试一次；恢复时静默关闭事件；boot_id 变化时遗留事件按新事件处理，立即唤醒；dry run 不消耗检测（运行时 hook_state_set 跳过 dry run）。
+- 快照：serve.log 关键行（lock acquired、getupdates error、queued inbox）加本地 ISO 时间戳，旧 grep 子串保留；看门狗每 tick 记录 checked_at、pid_file 值、proc 存在性、cmdline 首词、check_reason（pid_file_missing / pid_file_empty / pid_file_unreadable / proc_missing / proc_cmdline_mismatch / kill_failed），不再全折叠成 false。
+- 通道状态：bridge 新增 state/channel_status.json（atomic_write_json，0600），每次 getupdates 后更新：status、last_attempt_ts、last_success_ts、consecutive_failures、last_error（经 _sanitize_error 脱敏截断）、process_pid。成功空响应算成功；无新消息不算通道失败；ret -14 走 NEEDS_RELOGIN，不记入通道错误。
+- 并发启动：已证伪，无新增锁。serve_loop 先 flock，失败返回 2，PID 写入在 flock 成功之后；tests/test_v104.py 用持锁进程验证失败启动者不改 serve.pid。
+- 修正：测试中发现 save_state 空 seen 列表时 jq 管道回退会产出 "[]\n[]" 导致 hook state 写空，dedup 失效；已改为 seen 为空时直接用 '[]'，并由 test_v104_watchdog.sh 覆盖。
+- errno 111 排查优先级（收敛后）：在确认默认 urllib 走 HTTP 代理的前提下，优先排查“桥接器 -> 代理”；代理 CONNECT 返回非 200 时 CPython 通常报 Tunnel connection failed，不会原样传回代理机上的 errno 111；最终以实际连接地址为准，日志 target 不能替代实际连接地址。
+- “45+45 秒”只是串行尝试的粗略描述，不是严格总耗时上限（urllib timeout 针对阻塞操作）。
+- 网络测试不必全部等待 P0：代理配置检查、仅记录连接地址的跟踪、带独立时间戳的连通性测试，现在就有意义；P0 只是让真实故障更容易关联。
+- 发布记录要求：Tag 说明必须同时包含 bridge.py 和看门狗脚本的版本/哈希，部署结果可核对。
+
+## v1.0.4 复核补丁（2026-10-29，退回修改后，仍未部署）
+
+- 实例标识：_init_channel_status() 在 flock 成功后、serve.pid 写入前执行，生成 uuid run_id，写 serve_run.json（run_id、pid、started_ts）和 pending channel_status（last_success_ts 为空）。后续 _record_channel_status 保留该 run_id 和 process_started_ts。PID 复用也不能把旧成功当成新成功。
+- Worker 规则：删除 ok/0 兜底，确认通道恢复必须同时满足 status ok、consecutive_failures 0、process_pid 等于当前 serve.pid、run_id 等于 serve_run.run_id、last_success_ts 不为空且不早于 process_started_ts；任一不满足只报“进程已恢复，通道待确认”。
+- 快照：snapshot_json() 统一字段，全部 wake/silent 分支先 log 快照再退出；真实运行时 wake/silent 会退出脚本，已按 ~/hooks/runtime/hatch_hook_runtime.sh 核对，不依赖 wake 后的补记。PID 字段统一为 pid；PID 文件 cat 失败记 pid_file_unreadable，不冒充空文件。
+- seen：首次/重试掉线带 inbox 时先 mark_seen 再唤醒；seen 的语义是“已包含在一次唤醒里”，不是“已被 Worker 处理”，不等于严格一次投递。
+- 健壮性：_record_channel_status 全程不抛异常；prev 非对象、失败数非整数/布尔/负数、last_success_ts 非字符串时重置为安全默认值并打印警告；写入失败打印警告，不静默吞掉。
+- 测试补齐：test_v104.py 增加实例隔离与字段类型异常；test_v104_watchdog.sh 的 stub log 改为保留 JSON 第二参数，并增加全部终止分支快照字段、首次/重试 inbox 去重、boot_id 变化立即新事件、299 秒仍抑制/300 秒重试同 event_id 且 wake_count 加 1。
+- 复核清单第 6 项：真实 hook runtime 的 wake/silent 退出、hook state 写入与 dry run 契约已核对运行时脚本；同一 hook tick 串行性未在包内断言，部署后以实际 hook 日志为准。
+
+## v1.0.4 GPT 裁决补丁（2026-10-29，仍未部署）
+
+- 启动期与运行期失败策略解耦：_init_channel_status 任一必要写入失败即抛异常，serve_loop 捕获后返回 1，不写 serve.pid，不冒充 token 过期；_record_channel_status 写入失败只警告继续，不逃出循环。
+- 内核身份：_boot_id() 读 /proc/sys/kernel/random/boot_id；_proc_starttime() 解析 /proc/self/stat 在最后一个右括号后的第 22 字段（jiffies），comm 含空格/括号也不会错位。serve_run.json 含 run_id、pid、boot_id、proc_starttime；channel_status 也保留 boot_id/proc_starttime。
+- Worker 规则：删除 last_success_ts >= process_started_ts 的时间比较；last_success_ts 只作可读新鲜度证据。确认通道恢复必须同时满足 status ok、失败数 0、process_pid 等于当前 serve.pid、run_id 等于 serve_run.run_id、boot_id 等于当前 boot_id、proc_starttime 等于当前 /proc/<pid>/stat 第 22 字段。任一缺失/不匹配/读取中变化都只能是未确认。
+- inbox 重提醒：hook state 增加 inbox_wake {文件: last_wake_ms}；首次见或仍在 inbox 且距上次唤醒 >=300 秒时纳入唤醒；只有实际唤醒时刷新；被抑制 tick 不刷新；文件离开 inbox 后在下次保存状态时清理；进程恢复不取消重提醒。seen 仍保留作兼容，但唤醒决策以 inbox_wake 为准。
+- 故障注入测试 test_v104_gpt.py：旧匹配文件 + PID 复用（旧 proc_starttime=1）下新初始化覆盖为 pending 新 run_id；写 serve_run 前失败与写 channel_status 前失败均返回 1 且 serve.pid 哨兵不动；无注入时先 pending 再空成功才变 ok/0；运行期写失败只警告不抛。
+- 看门狗重提醒测试 test_v104_gpt_watchdog.sh：t0 唤醒、299 秒静默且不刷新、300 秒同一文件重提醒、文件离开后清理且不再唤醒。
+- GPT 对 Gemini 修正结论的限定已采纳：初始化失败终止不是唯一理论正确架构，但在当前补丁采用启动失败策略更容易验收；TTL 不是唯一解，必要的是未消费文件具有有界重试或可靠确认机制，本补丁采用 300 秒重提醒。
+
+## v1.0.4 复核第二轮补丁（2026-10-29，仍未部署）
+
+- Worker 端到端核验：test_v104_worker_verify.py 用真实 dummy 进程（argv 为 python3 bridge.py serve）调用生产 verify_channel_recovery()，覆盖旧匹配文件 + PID 复用（旧 proc_starttime=1）必为 proc_starttime_mismatch、初始化中间态（新 serve_run、旧 channel）必为 run_id_mismatch、同实例 pending 必不恢复、ok 必恢复、旧格式无内核身份必不恢复、进程死亡必为 process_not_running；另在 test_v104_gpt.py 中补 PID 复用初始化失败（serve.pid 已等于测试进程 PID，失败仍返回 1 且 PID 不变，生产核验必不恢复）与 replace 阶段失败（os.replace 抛错仍返回 1、PID 不变、旧 JSON 仍可解析）。
+- 诊断外逃：test_v104_diag.py 同时让状态写入失败与 print 抛 BrokenPipeError，_record_channel_status 仍返回 error，不向外抛。
+- 299 秒测试强度：test_v104_gpt_watchdog.sh 在 299 秒静默 tick 前后直接断言 inbox_wake 值不变，再做 300 秒边界；不再靠后续改写时间掩盖错误刷新。
+- README 最新规则声明已加：部署时只用最新 Worker 规则与最新哈希，历史段旧时间比较规则与旧哈希已作废，不得照抄。
