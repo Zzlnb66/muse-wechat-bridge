@@ -180,3 +180,10 @@
 - 诊断外逃：test_v104_diag.py 同时让状态写入失败与 print 抛 BrokenPipeError，_record_channel_status 仍返回 error，不向外抛。
 - 299 秒测试强度：test_v104_gpt_watchdog.sh 在 299 秒静默 tick 前后直接断言 inbox_wake 值不变，再做 300 秒边界；不再靠后续改写时间掩盖错误刷新。
 - README 最新规则声明已加：部署时只用最新 Worker 规则与最新哈希，历史段旧时间比较规则与旧哈希已作废，不得照抄。
+
+## v1.0.4 部署与微信实测（2026-10-29）
+
+- 上传 18:46：GitHub main，4 个提交 e3967a7 / 9882ed5 / 7ce8c2d / 21f2e6f，提交总数 25 -> 29。
+- 部署 18:49-18:51：旧 v1.0.3（PID 1758，SHA d41d9b0d…）备份到 workspace/wechat-bridge-backup-20261029-pre-v104/；新 serve PID 18981，run_id 08b95f00ee10402db3aa2bc9ce29aeef，通道 pending -> ok 于 18:50:58，verify-channel recovered=true；session.json 未动，NEEDS_RELOGIN 不存在，inbox/pending 为空；并发重启尝试被 flock 挡回。
+- 微信实测：/ping 快速回复（18:55:41）、普通文字、用户图片、生成花枝鼠形象并回图，4 条全部有回复；19:02:14 verify-channel 仍 ok，19:04:53 最近一次成功。
+- Tag v1.0.4 随后在 GitHub Releases 创建，指向本次文档提交。
