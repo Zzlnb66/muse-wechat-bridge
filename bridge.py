@@ -102,6 +102,22 @@ IMAGE_EVENT_FILE = os.path.join(STATE, "last_image_event.json")
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
 MAX_VIDEO_PLAIN_BYTES = 100 * 1024 * 1024
 MAX_VIDEO_CIPHER_BYTES = MAX_VIDEO_PLAIN_BYTES + 16
+# Item 2 (2026-10-31): ordinary file receive v1 limits. These are
+# trial-run values for the synchronous receive path, NOT WeChat
+# platform limits. A larger capacity needs the streaming/background
+# download version, not a bigger constant here.
+FILE_INBOUND_DIR = os.path.join(MEDIA_INBOUND, "files")
+FILE_SINGLE_PLAIN_CAP = 10 * 1024 * 1024
+FILE_SINGLE_CIPHER_CAP = FILE_SINGLE_PLAIN_CAP + 1024
+FILE_MESSAGE_TOTAL_CAP = 20 * 1024 * 1024
+FILE_MESSAGE_MAX_COUNT = 5
+FILE_MESSAGE_BUDGET_SECONDS = 60
+FILE_DOWNLOAD_ATTEMPTS = 2
+FILE_RECEIPTS_FILE = os.path.join(STATE, "file_receipts.json")
+# Test-only hook: extra allowed media origins for local test servers,
+# e.g. {("http", "127.0.0.1", 8765)}. Empty in production; never put
+# an HTTP localhost allowlist into the production configuration.
+_TEST_MEDIA_ORIGINS = set()
 MAX_IMAGE_PIXELS = 50_000_000
 CDN_BASE_DEFAULT = "https://novac2c.cdn.weixin.qq.com/c2c"
 SESSION_FILE = os.path.join(STATE, "session.json")
@@ -1415,6 +1431,20 @@ def extract_video_items(msg):
     return out
 
 
+def extract_file_items(msg):
+    """Return (original_item_list_index, file_item) pairs in order
+    (type=4). The ORIGINAL index is the stable key: a message mixing
+    media types would otherwise give a video and a file the same
+    per-type index 0, colliding in receipts and file names."""
+    out = []
+    for idx, item in enumerate(msg.get("item_list") or []):
+        if item.get("type") == 4:
+            fi = item.get("file_item") or {}
+            if isinstance(fi, dict):
+                out.append((idx, fi))
+    return out
+
+
 def _download_video_to_file(url, tmp_path, timeout=30):
     """Stream-download to tmp_path with a hard cipher cap.
     Returns (total_bytes, complete, error_type_or_None).
@@ -1595,6 +1625,305 @@ def process_inbound_video(video_item, message_id, index):
     diag["probe"] = probe
     return {"path": final_path, "cipher_size": total, "plain_size": len(plain),
             "probe": probe}, None, diag
+
+
+def _media_url_allowed(url):
+    """Production media-URL allowlist for file downloads.
+
+    Only HTTPS endpoints on WeChat hosts (the media CDN and the API
+    host) are fetched; anything else, including redirect targets, is
+    refused without a request. Test servers are allowed ONLY through
+    the _TEST_MEDIA_ORIGINS hook, which is empty in production."""
+    try:
+        p = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    if (p.scheme, p.hostname, p.port) in _TEST_MEDIA_ORIGINS:
+        return True
+    if p.scheme != "https":
+        return False
+    host = (p.hostname or "").lower()
+    return host == "ilinkai.weixin.qq.com" or host.endswith(".weixin.qq.com")
+
+
+def _resolve_file_media_url(file_item):
+    """Mirror the video URL resolution: full_url first, else a
+    constructed CDN URL from encrypt_query_param. Returns (url, source)
+    or (None, None)."""
+    media = file_item.get("media") if isinstance(file_item.get("media"), dict) else {}
+    full_url = media.get("full_url") or file_item.get("full_url")
+    if full_url:
+        return full_url, "full_url"
+    enc = media.get("encrypt_query_param") or file_item.get("encrypt_query_param")
+    if not enc:
+        return None, None
+    cdn_base = media.get("cdn_base_url") or file_item.get("cdn_base_url") or CDN_BASE_DEFAULT
+    return f"{cdn_base.rstrip('/')}/download?encrypted_query_param={urllib.parse.quote(str(enc))}", "constructed_cdn"
+
+
+def _clean_file_display_name(name, item_index):
+    """Display-only cleaning: the stored file name never uses this
+    value, so cleaning only protects what the Worker/user sees.
+    Control characters and path separators are stripped; an empty or
+    Windows-reserved result falls back to a generated name."""
+    if not isinstance(name, str):
+        name = ""
+    cleaned = "".join(ch for ch in name.strip() if ord(ch) >= 32 and ch not in "/\\")
+    cleaned = cleaned[:100]
+    base = cleaned.split(".")[0].upper() if cleaned else ""
+    reserved = base in ("CON", "PRN", "AUX", "NUL")
+    reserved = reserved or (base.startswith("COM") and base[3:].isdigit())
+    reserved = reserved or (base.startswith("LPT") and base[3:].isdigit())
+    if not cleaned or reserved:
+        return f"文件_{item_index}"
+    return cleaned
+
+
+def _file_receipts_load():
+    try:
+        with open(FILE_RECEIPTS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _file_receipts_save(receipts):
+    try:
+        atomic_write_json(FILE_RECEIPTS_FILE, receipts, mode=0o600)
+    except Exception as e:
+        print(f"file receipts write failed: {_sanitize_error(e)}", flush=True)
+
+
+def _file_receipt_get(message_id, item_index):
+    """Reuse a previously saved file for the same message+item, after
+    verifying size and sha256. Returns the saved dict or None."""
+    receipts = _file_receipts_load()
+    rec = receipts.get(f"{message_id}:{item_index}")
+    if not isinstance(rec, dict):
+        return None
+    path = rec.get("path")
+    try:
+        if not path or not os.path.isfile(path):
+            return None
+        if os.path.getsize(path) != rec.get("size"):
+            return None
+        if hashlib.sha256(open(path, "rb").read()).hexdigest() != rec.get("sha256"):
+            return None
+    except Exception:
+        return None
+    return {"attachment_id": rec.get("attachment_id"), "name": rec.get("name"),
+            "path": path, "size": rec.get("size"), "sha256": rec.get("sha256"),
+            "mime": rec.get("mime", "unknown"), "status": "saved"}
+
+
+def _file_receipt_put(message_id, item_index, saved):
+    receipts = _file_receipts_load()
+    receipts[f"{message_id}:{item_index}"] = dict(saved)
+    _file_receipts_save(receipts)
+
+
+def _download_file_to_file(url, tmp_path, budget_seconds, cap_bytes):
+    """Curl-only bounded download. Returns (size, complete, error).
+    --max-time is the REMAINING budget (not a fresh budget per try);
+    --fail rejects HTTP errors; up to 3 redirects are followed and
+    the FINAL URL must still pass the allowlist. Any failure removes
+    the partial file. The subprocess timeout equals the budget as a
+    backstop; curl's own --max-time is the binding limit."""
+    if budget_seconds <= 0:
+        return 0, False, "BUDGET_EXHAUSTED"
+    if not shutil.which("curl"):
+        return 0, False, "CURL_MISSING"
+    budget = max(1, int(budget_seconds))
+    cmd = ["curl", "-sS", "-L", "--max-redirs", "3", "--http1.1",
+           "--max-time", str(budget), "--max-filesize", str(cap_bytes),
+           "--fail", "--raw",
+           "-H", "Accept-Encoding: identity",
+           "-H", "User-Agent: Mozilla/5.0",
+           "-H", "iLink-App-Id: bot",
+           "-o", tmp_path, "-w", "%{url_effective}", url]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=budget)
+    except Exception as e:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return 0, False, type(e).__name__
+    if r.returncode != 0:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return 0, False, "CURL_DOWNLOAD_FAILED"
+    effective = r.stdout.decode("utf-8", "ignore").strip().splitlines()
+    effective = effective[-1] if effective else url
+    if not _media_url_allowed(effective):
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return 0, False, "REDIRECT_HOST_NOT_ALLOWED"
+    try:
+        size = os.path.getsize(tmp_path)
+        os.chmod(tmp_path, 0o600)
+    except OSError:
+        return 0, False, "STAT_FAILED"
+    if size > cap_bytes:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return size, False, "OVER_CIPHER_CAP"
+    return size, True, None
+
+
+def process_inbound_file(file_item, message_id, item_index, deadline_ts, plain_budget_left):
+    """Ordinary file receive v1: bounded download, strict AES-128-ECB
+    decrypt, atomic save under media/inbound/files/<mid>/.
+    Returns (saved_or_None, error, diag). Diag is desensitized:
+    field names and lengths only, never key values, never URL, never
+    body. No plaintext fallback: missing/invalid key, bad padding,
+    truncation, over-cap and timeout all fail, never save ciphertext
+    as plaintext. The declared `len` is recorded only: its inbound
+    semantics are unconfirmed, so a mismatch never rejects a file.
+    plain_budget_left is the message's remaining plain total (20 MiB
+    minus already-saved files); exceeding it fails BEFORE publish.
+    A previously receipted file for the same message+item is reused
+    after size+sha verification, without re-downloading."""
+    mid = str(message_id)
+    media = file_item.get("media") if isinstance(file_item.get("media"), dict) else {}
+    diag = {"message_id": mid, "item_index": item_index,
+            "item_fields": sorted(file_item.keys()) if isinstance(file_item, dict) else [],
+            "media_fields": sorted(media.keys()),
+            "encrypt_type": media.get("encrypt_type") if "encrypt_type" in media else file_item.get("encrypt_type"),
+            "declared_len": file_item.get("len"),
+            "declared_file_name": file_item.get("file_name"),
+            "download_source": None, "failure_stage": None, "error_code": None,
+            "cipher_size": None, "plain_size": None, "sha256": None}
+    if not mid.isdigit():
+        diag["failure_stage"] = "save"
+        diag["error_code"] = "INVALID_MESSAGE_ID"
+        return None, "file message_id has path characters, refusing", diag
+    reused = _file_receipt_get(mid, item_index)
+    if reused:
+        diag["download_source"] = "receipt_reuse"
+        diag["plain_size"] = reused["size"]
+        diag["sha256"] = reused["sha256"]
+        return reused, None, diag
+    full_url, source = _resolve_file_media_url(file_item)
+    if not full_url:
+        diag["failure_stage"] = "download"
+        diag["error_code"] = "NO_DOWNLOAD_PARAM"
+        return None, "file has no full_url and no encrypt_query_param", diag
+    if not _media_url_allowed(full_url):
+        diag["failure_stage"] = "download"
+        diag["error_code"] = "URL_NOT_ALLOWED"
+        return None, "file download host not allowed", diag
+    diag["download_source"] = source
+    key, _kdiag, kerr = parse_aes_key_diag(file_item)
+    if kerr == "KEY_FORMAT_ERROR":
+        diag["failure_stage"] = "decrypt"
+        diag["error_code"] = "KEY_FORMAT_ERROR"
+        return None, "file key format error, refusing plaintext fallback", diag
+    if key is None:
+        diag["failure_stage"] = "decrypt"
+        diag["error_code"] = "NO_KEY"
+        return None, "file has no aes_key, refusing plaintext fallback", diag
+    ensure_dirs()
+    file_dir = os.path.join(FILE_INBOUND_DIR, mid)
+    try:
+        os.makedirs(file_dir, exist_ok=True)
+        os.chmod(file_dir, 0o700)
+    except Exception:
+        diag["failure_stage"] = "save"
+        diag["error_code"] = "SAVE_FAILED"
+        return None, "file directory create failed", diag
+    cipher_tmp = os.path.join(file_dir, f"item_{item_index}.cipher.tmp.{os.getpid()}")
+    cipher_size = None
+    derr = None
+    for _attempt in range(FILE_DOWNLOAD_ATTEMPTS):
+        remaining = deadline_ts - time.time()
+        if remaining <= 0:
+            derr = "BUDGET_EXHAUSTED"
+            break
+        cipher_size, complete, derr = _download_file_to_file(full_url, cipher_tmp, remaining, FILE_SINGLE_CIPHER_CAP)
+        if complete:
+            break
+        if derr in ("URL_NOT_ALLOWED", "REDIRECT_HOST_NOT_ALLOWED"):
+            break
+    if cipher_size is None or derr is not None:
+        diag["failure_stage"] = "download"
+        diag["error_code"] = derr or "DOWNLOAD_FAILED"
+        return None, "file download failed", diag
+    if cipher_size == 0 or cipher_size % 16 != 0 or cipher_size > FILE_SINGLE_CIPHER_CAP:
+        diag["failure_stage"] = "download"
+        diag["error_code"] = "BAD_CIPHER_SIZE"
+        try:
+            os.remove(cipher_tmp)
+        except OSError:
+            pass
+        return None, "file cipher size invalid", diag
+    diag["cipher_size"] = cipher_size
+    try:
+        with open(cipher_tmp, "rb") as f:
+            cipher = f.read()
+        plain = aes_ecb_decrypt(cipher, key)
+    except Exception:
+        diag["failure_stage"] = "decrypt"
+        diag["error_code"] = "DECRYPT_FAILED"
+        try:
+            os.remove(cipher_tmp)
+        except OSError:
+            pass
+        return None, "file decrypt failed, ciphertext not saved as plaintext", diag
+    finally:
+        try:
+            os.remove(cipher_tmp)
+        except OSError:
+            pass
+    if len(plain) > FILE_SINGLE_PLAIN_CAP:
+        diag["failure_stage"] = "download"
+        diag["error_code"] = "OVER_SINGLE_CAP"
+        return None, "file plain size over 10MiB", diag
+    if len(plain) > plain_budget_left:
+        diag["failure_stage"] = "download"
+        diag["error_code"] = "OVER_MESSAGE_TOTAL"
+        return None, "file would exceed message total 20MiB", diag
+    display_name = _clean_file_display_name(file_item.get("file_name") or file_item.get("name"), item_index)
+    mime = file_item.get("mime_type") or file_item.get("content_type") or file_item.get("mime") or "unknown"
+    if not isinstance(mime, str):
+        mime = "unknown"
+    final_path = os.path.join(file_dir, f"item_{item_index}_{uuid.uuid4().hex[:12]}.bin")
+    tmp_path = final_path + f".tmp.{os.getpid()}"
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(plain)
+        os.chmod(tmp_path, 0o600)
+        if os.path.getsize(tmp_path) != len(plain):
+            raise OSError("short write")
+        os.replace(tmp_path, final_path)
+        os.chmod(final_path, 0o600)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        diag["failure_stage"] = "save"
+        diag["error_code"] = "SAVE_FAILED"
+        return None, "file save failed", diag
+    sha = hashlib.sha256(plain).hexdigest()
+    diag["plain_size"] = len(plain)
+    diag["sha256"] = sha
+    saved = {"attachment_id": f"{mid}:{item_index}", "name": display_name,
+             "path": final_path, "size": len(plain), "sha256": sha,
+             "mime": mime, "status": "saved"}
+    _file_receipt_put(mid, item_index, saved)
+    return saved, None, diag
 
 
 def send_video(session, video_path, to_user_id, context_token, client_id=None):
@@ -3145,6 +3474,8 @@ def build_safe_history_view(max_rounds=SAFE_VIEW_MAX_ROUNDS):
                 user_text = "【语音】"
             elif rec.get("videos"):
                 user_text = "附视频 %d 段" % len(rec["videos"])
+            elif rec.get("files"):
+                user_text = "附文件 %d 个" % len(rec["files"])
         answer_text = None
         try:
             sent = json.load(open(os.path.join(OUTBOX_SENT, "%s.json" % mid), encoding="utf-8"))
@@ -3944,6 +4275,7 @@ def serve_loop():
                 text = (text + voice_text) if text else voice_text
             image_items = extract_images(msg)
             video_items = extract_video_items(msg)
+            file_items = extract_file_items(msg)
             # M3 v1 toggle (WeChat videos carry no caption, so a caption
             # trigger alone cannot work): a text message "仅本地" or
             # "开启仅本地" turns local-only mode ON for all following videos;
@@ -3957,7 +4289,7 @@ def serve_loop():
             elif _toggle == "关闭仅本地":
                 set_local_only_mode(False)
                 print("serve: local-only mode OFF", flush=True)
-            if not text and not is_voice_only and not image_items and not video_items:
+            if not text and not is_voice_only and not image_items and not video_items and not file_items:
                 continue
             mid = str(msg.get("message_id"))
             if mid in processed:
@@ -4148,8 +4480,11 @@ def serve_loop():
                                       "errors": image_errors,
                                       "reason": image_errors[0].get("error_code") or "failed",
                                       "ts": int(time.time() * 1000)})
-            if image_items and not saved_images and not text:
+            if image_items and not saved_images and not text and not file_items:
                 # All images failed and no text: explicit prompt, no inbox.
+                # Item 2: files present means the message is not done:
+                # fall through to file processing instead of swallowing
+                # the files with the image prompt.
                 # Fix 2026-10-28: log the error strings (not the image
                 # item itself, which may contain download/decrypt params)
                 # so a failed image can be diagnosed after the fact.
@@ -4183,8 +4518,9 @@ def serve_loop():
                 else:
                     video_errors.append({"index": idx, "error": err,
                                          "error_code": (diag or {}).get("error_code")})
-            if video_items and not saved_videos and not text:
+            if video_items and not saved_videos and not text and not file_items:
                 # All videos failed and no text: explicit prompt, no inbox.
+                # Item 2: same guard as images; files still to process.
                 print(f"serve: video fail for {mid}.json errors={video_errors}", flush=True)
                 try:
                     _queued = send_direct_or_outbox(session, "视频接收失败，请重发",
@@ -4199,6 +4535,70 @@ def serve_loop():
                     continue
                 processed.add(mid); save_processed(processed)
                 print(f"serve: video fail prompt for {mid}.json", flush=True)
+                continue
+            # Item 2: local-only mode protects videos only. Files never
+            # inherit it: when the mode is on, refuse files here (no
+            # download, nothing to the Worker) and tell the user to
+            # turn the mode off and resend. This is the fixed choice
+            # (plan 2.4); the message is dropped whole, like every
+            # other direct-prompt path in this loop.
+            if file_items and read_local_only_mode():
+                print(f"serve: file refused under local-only mode for {mid}.json", flush=True)
+                try:
+                    _queued = send_direct_or_outbox(session, "仅本地模式只保护视频，文件不会只存本地；已暂不接收这份文件，请关闭仅本地模式后重发。",
+                                          session.get("ilink_user_id"), ctx, f"{mid}_file_local.json")
+                except TokenExpired:
+                    print("serve: token expired during file local-mode prompt, stopping.", flush=True)
+                    return 14
+                if not _queued:
+                    _batch_enqueue_failed = True
+                    print(f"serve: file local-mode prompt queue FAILED for {mid}, NOT marking processed, will retry", flush=True)
+                    continue
+                processed.add(mid); save_processed(processed)
+                print(f"serve: file local-mode prompt for {mid}.json", flush=True)
+                continue
+            # Item 2: ordinary file receive v1. Files are processed
+            # like images/videos but with their own caps, budget, and
+            # stable original-index keys. Download/decrypt failure
+            # never blocks the main loop; decrypt failure never saves
+            # ciphertext as plaintext; partial success proceeds.
+            saved_files = []
+            file_errors = []
+            file_deadline = time.time() + FILE_MESSAGE_BUDGET_SECONDS
+            file_plain_total = 0
+            for orig_idx, fi in file_items:
+                if len(saved_files) >= FILE_MESSAGE_MAX_COUNT:
+                    file_errors.append({"index": orig_idx, "error": "message file count over 5",
+                                        "error_code": "OVER_MESSAGE_COUNT"})
+                    continue
+                try:
+                    saved, err, diag = process_inbound_file(fi, mid, orig_idx, file_deadline,
+                                                            FILE_MESSAGE_TOTAL_CAP - file_plain_total)
+                except Exception as e:
+                    saved, err, diag = None, _sanitize_error(e), None
+                if saved:
+                    saved_files.append(saved)
+                    file_plain_total += saved["size"]
+                else:
+                    file_errors.append({"index": orig_idx, "error": err,
+                                        "error_code": (diag or {}).get("error_code")})
+            if file_items and not saved_files and not text and not saved_images and not saved_videos:
+                # All files failed and nothing else to queue: explicit
+                # prompt, no inbox. (If images/videos were also saved,
+                # the record below carries file_errors instead.)
+                print(f"serve: file fail for {mid}.json errors={file_errors}", flush=True)
+                try:
+                    _queued = send_direct_or_outbox(session, "文件接收失败，请重发",
+                                          session.get("ilink_user_id"), ctx, f"{mid}_file_fail.json")
+                except TokenExpired:
+                    print("serve: token expired during file fail prompt, stopping.", flush=True)
+                    return 14
+                if not _queued:
+                    _batch_enqueue_failed = True
+                    print(f"serve: file fail prompt queue FAILED for {mid}, NOT marking processed, will retry", flush=True)
+                    continue
+                processed.add(mid); save_processed(processed)
+                print(f"serve: file fail prompt for {mid}.json", flush=True)
                 continue
             # M3 defect fix: decide local_only intent BEFORE queueing analysis.
             # A local_only video must never be queued into analysis/ at all:
@@ -4279,6 +4679,10 @@ def serve_loop():
                     record["video_errors"] = video_errors
             if image_errors:
                 record["image_errors"] = image_errors
+            if saved_files:
+                record["files"] = saved_files
+            if file_errors:
+                record["file_errors"] = file_errors
             # Associator blocking: if this text is a follow-up about
             # an image ("这张图", "刚才那张", "图里", "写了什么",
             # "解释一下", etc.) and the latest image event is
