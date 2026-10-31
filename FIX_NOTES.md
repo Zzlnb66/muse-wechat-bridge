@@ -187,3 +187,11 @@
 - 部署 18:49-18:51：旧 v1.0.3（PID 1758，SHA d41d9b0d…）备份到 workspace/wechat-bridge-backup-20261029-pre-v104/；新 serve PID 18981，run_id 08b95f00ee10402db3aa2bc9ce29aeef，通道 pending -> ok 于 18:50:58，verify-channel recovered=true；session.json 未动，NEEDS_RELOGIN 不存在，inbox/pending 为空；并发重启尝试被 flock 挡回。
 - 微信实测：/ping 快速回复（18:55:41）、普通文字、用户图片、生成花枝鼠形象并回图，4 条全部有回复；19:02:14 verify-channel 仍 ok，19:04:53 最近一次成功。
 - Tag v1.0.4 随后在 GitHub Releases 创建，指向本次文档提交。
+
+## v1.1.0（2026-10-31，视频、仅本地、安全视图、引用、文件发送）
+
+- bridge.py 4299 行，SHA-256 57caaba04debbb34b2480ce4f79e8c1c6c87df23ab32447b6a46e37f1a7e6be0；新增 `send_file`（仅新增代码，视频函数未动；无视频失败自动转附件逻辑）。
+- 新增 `analyzer/`（m2_analyzer.py 245 行、stages.py 135 行）：五轨证据、融合修复（每段查全部重叠声音窗口）、叙事时间线。
+- 新增测试：tests/test_video_v1.py（视频收发 10 项）、tests/test_quote_v1.py（引用 10 项）；文件发送离线 6 项；视频回归与引用回归在部署前全过。
+- .gitignore 补上 analysis/ 与 local_vault/（此前未覆盖，运行数据与测试数据不得入库）。
+- 验收口径：实测通过即算通过，但每项均按“通过项 + 明确缺口”记录，不把实用实现倒写成正式结项；隐私与权重许可两组证据仍为已知缺口。
