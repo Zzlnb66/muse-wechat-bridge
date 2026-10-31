@@ -89,10 +89,20 @@ OUTBOX_PENDING = os.path.join(ROOT, "outbox", "pending")
 OUTBOX_SENT = os.path.join(ROOT, "outbox", "sent")
 OUTBOX_FAILED = os.path.join(ROOT, "outbox", "failed")
 MEDIA_INBOUND = os.path.join(ROOT, "media", "inbound")
+ANALYSIS_DIR = os.path.join(ROOT, "analysis")
+LOCAL_VAULT_DIR = os.path.join(ROOT, "local_vault")
+LOCAL_ONLY_MODE_FILE = os.path.join(STATE, "local_only_mode.json")
+PENDING_LOCAL_QUERIES_FILE = os.path.join(STATE, "pending_local_queries.json")
+TTL_INDEX_FILE = os.path.join(STATE, "local_ttl_index.json")
+TOMBSTONE_FILE = os.path.join(STATE, "local_tombstones.json")
+LOCAL_TTL_SECONDS = 48 * 3600
+TOMBSTONE_RETENTION_SECONDS = 90 * 86400
 MEDIA_OUTBOUND = os.path.join(ROOT, "media", "outbound")
 FAILURES_DIR = os.path.join(ROOT, "failures")
 IMAGE_EVENT_FILE = os.path.join(STATE, "last_image_event.json")
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
+MAX_VIDEO_PLAIN_BYTES = 100 * 1024 * 1024
+MAX_VIDEO_CIPHER_BYTES = MAX_VIDEO_PLAIN_BYTES + 16
 MAX_IMAGE_PIXELS = 50_000_000
 CDN_BASE_DEFAULT = "https://novac2c.cdn.weixin.qq.com/c2c"
 SESSION_FILE = os.path.join(STATE, "session.json")
@@ -193,7 +203,7 @@ class PermanentError(ApiError):
 
 def ensure_dirs():
     for d in (STATE, INBOX, RUNNING, DONE, OUTBOX_PENDING, OUTBOX_SENT,
-              OUTBOX_FAILED, MEDIA_INBOUND, MEDIA_OUTBOUND, FAILURES_DIR):
+              OUTBOX_FAILED, MEDIA_INBOUND, MEDIA_OUTBOUND, FAILURES_DIR, ANALYSIS_DIR, LOCAL_VAULT_DIR):
         os.makedirs(d, exist_ok=True)
 
 
@@ -802,6 +812,138 @@ def extract_text(msg):
 # 2026-10-28, 359 tokens for this function); Muse added the
 # has-voice / missing-text distinction so a voice message with no
 # transcription is never silently dropped and never fabricated.
+def _quoted_text_from_message_item(qitem):
+    """Text inside a ref_msg.message_item, either a MessageItem with its
+    own item_list or a single item carrying type/text_item."""
+    parts = []
+    if not isinstance(qitem, dict):
+        return ""
+    items = qitem.get("item_list") or []
+    if items:
+        for it in items:
+            if isinstance(it, dict) and it.get("type") == 1:
+                t = (it.get("text_item") or {}).get("text")
+                if t:
+                    parts.append(t)
+    elif qitem.get("type") == 1:
+        t = (qitem.get("text_item") or {}).get("text")
+        if t:
+            parts.append(t)
+    return "".join(parts)
+
+
+def extract_quote(msg):
+    """Raw quote info from an upstream ref_msg, or None.
+
+    Mirrors upstream inbound.findReferenceItem/applyInlineQuoteContext
+    (openclaw-weixin 874637a): the first item_list entry carrying ref_msg;
+    id = svr_id, else message_item.msg_id; inline body = title + quoted
+    message_item text. No media is copied here; resolution against bridge
+    records (with the local/deleted guard) happens in resolve_quote()."""
+    for item in msg.get("item_list") or []:
+        if not isinstance(item, dict):
+            continue
+        ref = item.get("ref_msg")
+        if not isinstance(ref, dict):
+            continue
+        qitem = ref.get("message_item") or {}
+        qid = ""
+        if isinstance(ref.get("svr_id"), str):
+            qid = ref["svr_id"].strip()
+        if not qid and isinstance(qitem, dict) and isinstance(qitem.get("msg_id"), str):
+            qid = qitem["msg_id"].strip()
+        title = ref["title"].strip() if isinstance(ref.get("title"), str) else ""
+        # Type 0 is upstream NONE, not a real kind: the 2026-10-31 live
+        # quote test recorded quoted_type 0 for a plain text message, so
+        # treat 0 as unknown and let resolve_quote derive it from the
+        # bridge record (or from inline text) instead.
+        qtype = None
+        if isinstance(qitem, dict):
+            if isinstance(qitem.get("type"), int) and qitem.get("type") != 0:
+                qtype = qitem.get("type")
+            else:
+                for it in qitem.get("item_list") or []:
+                    if isinstance(it, dict) and it.get("type") in (2, 3, 4, 5):
+                        qtype = it.get("type")
+                        break
+        return {
+            "quoted_message_id": qid or None,
+            "quoted_title": title or None,
+            "quoted_inline_text": _quoted_text_from_message_item(qitem) or None,
+            "quoted_type": qtype,
+        }
+    return None
+
+
+def resolve_quote(quote):
+    """Resolve a raw quote against bridge records, with the guard first.
+
+    NEVER returns quoted text, title, or media info for a local-only or
+    tombstoned target: the quoted target's content must not be resurrected
+    through a quote. Unknown targets are marked unresolved, never guessed."""
+    if not quote:
+        return None
+    qid = quote.get("quoted_message_id")
+    tombs = load_tombstones()
+    target = None
+    if qid:
+        for d in (DONE, INBOX):
+            p = os.path.join(d, "%s.json" % qid)
+            if os.path.exists(p):
+                try:
+                    with open(p, encoding="utf-8") as f:
+                        target = json.load(f)
+                    break
+                except Exception:
+                    target = None
+        if qid in tombs or (isinstance(target, dict) and target.get("local_only")):
+            return {
+                "quoted_message_id": qid,
+                "quoted_local_only": True,
+                "quoted_deleted": bool(qid in tombs),
+                "quoted_note": "引用目标为仅本地或已删除内容，不可见",
+            }
+    out = {"quoted_message_id": qid}
+    if quote.get("quoted_title"):
+        out["quoted_title"] = quote["quoted_title"][:200]
+    if isinstance(target, dict):
+        out["quoted_resolved"] = True
+        # Derive the kind from the bridge record, never from the
+        # unreliable ref.message_item type: text 1, image 2, voice 3,
+        # video 5 (upstream MessageItemType).
+        if target.get("images"):
+            out["quoted_type"] = 2
+            out["quoted_image_count"] = len(target["images"])
+            # Quote-image re-attachment v1: copy the quoted image entries
+            # (same shape as a record's own "images") so the Worker can
+            # read the quoted picture from the inbox record. Local-only
+            # targets never reach here: the guard above returns first,
+            # and local-only applies to videos only, never to images.
+            out["quoted_images"] = [dict(e) for e in target["images"]]
+        elif target.get("videos"):
+            out["quoted_type"] = 5
+            out["quoted_video_count"] = len(target["videos"])
+        elif target.get("source") == "voice":
+            out["quoted_type"] = 3
+        elif target.get("text"):
+            out["quoted_type"] = 1
+        elif quote.get("quoted_type") is not None:
+            out["quoted_type"] = quote["quoted_type"]
+        if target.get("text"):
+            out["quoted_text"] = target["text"][:1000]
+        elif quote.get("quoted_inline_text"):
+            out["quoted_text"] = quote["quoted_inline_text"][:1000]
+    elif quote.get("quoted_inline_text"):
+        out["quoted_resolved"] = True
+        out["quoted_text"] = quote["quoted_inline_text"][:1000]
+        out["quoted_type"] = 1
+    else:
+        out["quoted_unresolved"] = True
+        if quote.get("quoted_type") is not None:
+            out["quoted_type"] = quote["quoted_type"]
+    return out
+
+
 def has_voice_item(msg):
     for item in msg.get("item_list") or []:
         if item.get("type") == 3:
@@ -1245,6 +1387,482 @@ def extract_images(msg):
             if isinstance(ii, dict):
                 out.append(ii)
     return out
+
+
+def extract_video_items(msg):
+    """Return video_item dicts in original item_list order (type=5)."""
+    out = []
+    for item in msg.get("item_list") or []:
+        if item.get("type") == 5:
+            vi = item.get("video_item") or {}
+            if isinstance(vi, dict):
+                out.append(vi)
+    return out
+
+
+def _download_video_to_file(url, tmp_path, timeout=30):
+    """Stream-download to tmp_path with a hard cipher cap.
+    Returns (total_bytes, complete, error_type_or_None).
+    complete requires: read loop finished AND (no Content-Length OR
+    Content-Length == total). On over-cap, the partial file is removed.
+    Curl fallback is used only when urllib did not complete."""
+    import urllib.request as _ur
+    total = 0
+    complete = False
+    err = None
+    try:
+        req = _ur.Request(url, headers={"User-Agent": "Mozilla/5.0",
+                                        "iLink-App-Id": "bot",
+                                        "Accept-Encoding": "identity"})
+        with _ur.urlopen(req, timeout=timeout) as r:
+            cl = r.headers.get("Content-Length")
+            try:
+                cl_int = int(str(cl).strip()) if cl is not None else None
+            except Exception:
+                cl_int = None
+            if cl_int is not None and cl_int > MAX_VIDEO_CIPHER_BYTES:
+                return 0, False, "OVER_CIPHER_CAP"
+            with open(tmp_path, "wb") as f:
+                os.chmod(tmp_path, 0o600)
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_VIDEO_CIPHER_BYTES:
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+                        return total, False, "OVER_CIPHER_CAP"
+                    f.write(chunk)
+            complete = (cl_int is None or cl_int == total)
+    except Exception as e:
+        err = type(e).__name__
+    if complete:
+        return total, True, None
+    # Curl fallback (streaming to file, same cap).
+    if shutil.which("curl"):
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            cmd = ["curl", "-sS", "--http1.1", "--max-time", "60",
+                   "--max-filesize", str(MAX_VIDEO_CIPHER_BYTES),
+                   "--raw", "-H", "Accept-Encoding: identity",
+                   "-H", "User-Agent: Mozilla/5.0",
+                   "-H", "iLink-App-Id: bot",
+                   "-o", tmp_path, url]
+            r = subprocess.run(cmd, capture_output=True, timeout=70)
+            if r.returncode == 0 and os.path.exists(tmp_path):
+                sz = os.path.getsize(tmp_path)
+                os.chmod(tmp_path, 0o600)
+                if 0 < sz <= MAX_VIDEO_CIPHER_BYTES:
+                    return sz, True, None
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            return 0, False, "CURL_DOWNLOAD_FAILED"
+        except Exception as e:
+            return 0, False, type(e).__name__
+    return total, False, err or "DOWNLOAD_FAILED"
+
+
+def process_inbound_video(video_item, message_id, index):
+    """Practical video receive v1: download (streaming, capped),
+    AES-128-ECB decrypt, save to media/inbound, best-effort ffprobe.
+    Returns (saved_or_None, error, diag). Diag is desensitized:
+    field names, lengths, formats only; never key values, never URL,
+    never body. No plaintext fallback: missing/invalid key, bad
+    padding, over-cap and incomplete download all fail, never save
+    ciphertext as plaintext. ffprobe failure never rejects a video:
+    probe is informational only in v1 (container is not validated)."""
+    media = video_item.get("media") if isinstance(video_item.get("media"), dict) else {}
+    diag = {"message_id": message_id, "index": index,
+            "item_fields": sorted(video_item.keys()) if isinstance(video_item, dict) else [],
+            "media_fields": sorted(media.keys()),
+            "encrypt_type": media.get("encrypt_type") if "encrypt_type" in media else video_item.get("encrypt_type"),
+            "declared_video_size": video_item.get("video_size"),
+            "download_source": None, "failure_stage": None, "error_code": None,
+            "cipher_size": None, "plain_size": None, "probe": None}
+    full_url = media.get("full_url") or video_item.get("full_url")
+    if full_url:
+        diag["download_source"] = "full_url"
+    else:
+        enc = media.get("encrypt_query_param") or video_item.get("encrypt_query_param")
+        if not enc:
+            diag["failure_stage"] = "download"
+            diag["error_code"] = "NO_DOWNLOAD_PARAM"
+            return None, "no full_url and no encrypt_query_param", diag
+        diag["download_source"] = "constructed_cdn"
+        cdn_base = media.get("cdn_base_url") or video_item.get("cdn_base_url") or CDN_BASE_DEFAULT
+        full_url = f"{cdn_base.rstrip('/')}/download?encrypted_query_param={urllib.parse.quote(str(enc))}"
+    key, _kdiag, kerr = parse_aes_key_diag(video_item)
+    if kerr == "KEY_FORMAT_ERROR":
+        diag["failure_stage"] = "decrypt"
+        diag["error_code"] = "KEY_FORMAT_ERROR"
+        return None, "video key format error, refusing plaintext fallback", diag
+    if key is None:
+        diag["failure_stage"] = "decrypt"
+        diag["error_code"] = "NO_KEY"
+        return None, "video has no aes_key, refusing plaintext fallback", diag
+    ensure_dirs()
+    cipher_tmp = os.path.join(MEDIA_INBOUND, f"{message_id}_{index}.cipher.tmp.{os.getpid()}")
+    try:
+        total, complete, derr = _download_video_to_file(full_url, cipher_tmp)
+    except Exception as e:
+        diag["failure_stage"] = "download"
+        diag["error_code"] = type(e).__name__
+        return None, "video download failed", diag
+    if not complete:
+        diag["failure_stage"] = "download"
+        diag["error_code"] = derr or "DOWNLOAD_INCOMPLETE"
+        return None, "video download incomplete or over cap", diag
+    if total % 16 != 0 or total > MAX_VIDEO_CIPHER_BYTES:
+        diag["failure_stage"] = "download"
+        diag["error_code"] = "BAD_CIPHER_SIZE"
+        try:
+            os.remove(cipher_tmp)
+        except OSError:
+            pass
+        return None, "video cipher size invalid", diag
+    diag["cipher_size"] = total
+    try:
+        with open(cipher_tmp, "rb") as f:
+            cipher = f.read()
+        plain = aes_ecb_decrypt(cipher, key)
+    except Exception as e:
+        diag["failure_stage"] = "decrypt"
+        diag["error_code"] = "DECRYPT_FAILED"
+        try:
+            os.remove(cipher_tmp)
+        except OSError:
+            pass
+        return None, "video decrypt failed, ciphertext not saved as plaintext", diag
+    finally:
+        try:
+            os.remove(cipher_tmp)
+        except OSError:
+            pass
+    if len(plain) > MAX_VIDEO_PLAIN_BYTES:
+        diag["failure_stage"] = "download"
+        diag["error_code"] = "OVER_PLAIN_CAP"
+        return None, "video plain size over 100MiB", diag
+    diag["plain_size"] = len(plain)
+    final_path = os.path.join(MEDIA_INBOUND, f"{message_id}_{index}.mp4")
+    tmp_path = final_path + f".tmp.{os.getpid()}"
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(plain)
+        os.chmod(tmp_path, 0o600)
+        if os.path.getsize(tmp_path) != len(plain):
+            raise OSError("short write")
+        os.replace(tmp_path, final_path)
+        os.chmod(final_path, 0o600)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        diag["failure_stage"] = "save"
+        diag["error_code"] = "SAVE_FAILED"
+        return None, "video save failed", diag
+    probe = None
+    if shutil.which("ffprobe"):
+        try:
+            r = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                                "format=duration,format_name:stream=codec_type,codec_name,width,height",
+                                "-of", "json", final_path],
+                               capture_output=True, timeout=20)
+            if r.returncode == 0:
+                probe = json.loads(r.stdout.decode("utf-8", "ignore") or "{}")
+        except Exception:
+            probe = None
+    diag["probe"] = probe
+    return {"path": final_path, "cipher_size": total, "plain_size": len(plain),
+            "probe": probe}, None, diag
+
+
+def send_video(session, video_path, to_user_id, context_token, client_id=None):
+    """Practical video send v1: getuploadurl (media_type=2) -> upload
+    ciphertext -> sendmessage type=5. Mirrors send_image, except:
+    no container/format validation (any file may be sent, labelled
+    .mp4 upstream only by convention), 100MiB plain cap, curl upload
+    cap raised to the cipher cap. Returns sendmessage response.
+    Raises ApiError on any strict failure; final-send failure is
+    UnknownDeliveryError (may already be delivered, do NOT auto-retry)."""
+    if not _is_allowed_image_path(video_path):
+        raise PermanentError("send_video: path outside allowed media dirs, refusing")
+    if not os.path.exists(video_path):
+        raise PermanentError("send_video: file missing")
+    with open(video_path, "rb") as f:
+        plain = f.read()
+    if len(plain) > MAX_VIDEO_PLAIN_BYTES:
+        raise PermanentError("send_video: over 100MiB")
+    rawsize = len(plain)
+    rawmd5 = hashlib.md5(plain).hexdigest()
+    filekey = uuid.uuid4().hex
+    key = os.urandom(16)
+    aeskey_hex = key.hex()
+    ciphertext = aes_ecb_encrypt(plain, key)
+    filesize = len(ciphertext)
+    base = session.get("baseurl") or DEFAULT_BASE
+    payload = {"media_type": 2, "rawsize": rawsize, "rawfilemd5": rawmd5,
+               "filesize": filesize, "filekey": filekey, "aeskey": aeskey_hex,
+               "no_need_thumb": True, "base_info": base_info(),
+               "ilink_user_id": session.get("ilink_user_id"),
+               "to_user_id": to_user_id or session.get("ilink_user_id")}
+    try:
+        resp = post_json(base, "/ilink/bot/getuploadurl", payload,
+                         session=session, authenticated=True, timeout=15)
+        check_ret(resp, "getuploadurl")
+    except TokenExpired:
+        raise
+    except ApiError as e:
+        raise RetryableError(f"getuploadurl failed: {e}")
+    data = resp.get("data") if isinstance(resp.get("data"), dict) else resp
+    upload_full_url = data.get("upload_full_url") or resp.get("upload_full_url")
+    upload_param = data.get("upload_param") or resp.get("upload_param")
+    returned_filekey = data.get("filekey") or resp.get("filekey") or filekey
+    if not upload_full_url and upload_param:
+        if isinstance(upload_param, str) and upload_param.startswith("http"):
+            upload_full_url = upload_param
+            if "filekey" not in upload_full_url:
+                sep = "&" if "?" in upload_full_url else "?"
+                upload_full_url = f"{upload_full_url}{sep}filekey={urllib.parse.quote(str(returned_filekey))}"
+        elif isinstance(upload_param, dict) and upload_param.get("url"):
+            upload_full_url = upload_param["url"]
+    if not upload_full_url:
+        raise RetryableError("getuploadurl: no upload_full_url and no usable upload_param")
+    encrypt_param = None
+    if shutil.which("curl"):
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False) as tf:
+            tf.write(ciphertext)
+            tmp_path = tf.name
+        hdr_path = tmp_path + ".hdr"
+        try:
+            cmd = ["curl", "-s", "--max-time", "60", "--max-filesize", str(MAX_VIDEO_CIPHER_BYTES),
+                   "-D", hdr_path, "-o", "/dev/null",
+                   "-w", "%{http_code}", "-X", "POST",
+                   "-H", "Content-Type: application/octet-stream",
+                   "--data-binary", f"@{tmp_path}", upload_full_url]
+            try:
+                r = subprocess.run(cmd, capture_output=True, timeout=70)
+            except subprocess.TimeoutExpired:
+                raise RetryableError("upload curl timeout") from None
+            except Exception as e:
+                raise RetryableError(f"upload curl failed: {type(e).__name__}") from None
+            http_code = (r.stdout or b"").decode().strip()
+            try:
+                with open(hdr_path, encoding="utf-8", errors="ignore") as hf:
+                    for line in hf:
+                        if line.lower().startswith("x-encrypted-param:"):
+                            encrypt_param = line.split(":", 1)[1].strip()
+            except OSError:
+                pass
+            if http_code != "200" or not encrypt_param:
+                raise RetryableError(f"upload failed: http={http_code} x-encrypted-param={'present' if encrypt_param else 'missing'}")
+        finally:
+            for pp in (tmp_path, hdr_path):
+                try:
+                    os.remove(pp)
+                except OSError:
+                    pass
+    else:
+        req = urllib.request.Request(upload_full_url, data=ciphertext,
+                                     headers={"Content-Type": "application/octet-stream"},
+                                     method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                if r.status != 200:
+                    raise RetryableError(f"upload http={r.status}")
+                encrypt_param = r.headers.get("x-encrypted-param")
+        except RetryableError:
+            raise
+        except Exception as e:
+            raise RetryableError(f"upload failed: {type(e).__name__}") from None
+        if not encrypt_param:
+            raise RetryableError("upload failed: x-encrypted-param missing")
+    aes_key_b64 = base64.b64encode(aeskey_hex.encode("utf-8")).decode()
+    msg_payload = {
+        "msg": {
+            "from_user_id": "",
+            "to_user_id": to_user_id or session.get("ilink_user_id"),
+            "client_id": client_id or uuid.uuid4().hex,
+            "message_type": 2,
+            "message_state": 2,
+            "context_token": context_token if context_token is not None else (session.get("context_token") or ""),
+            "item_list": [{"type": 5, "video_item": {
+                "video_size": filesize,
+                "media": {
+                    "encrypt_query_param": encrypt_param.strip() if encrypt_param else encrypt_param,
+                    "aes_key": aes_key_b64,
+                    "encrypt_type": 1,
+                },
+            }}],
+        },
+        "base_info": base_info(),
+    }
+    try:
+        resp2 = post_json(base, "/ilink/bot/sendmessage", msg_payload,
+                          session=session, authenticated=True, timeout=15, allow_fallback=False)
+    except TokenExpired:
+        raise
+    except Exception as e:
+        raise UnknownDeliveryError(f"sendmessage-video post failed, result unknown: {e}")
+    try:
+        check_ret(resp2, "sendmessage-video")
+    except TokenExpired:
+        raise
+    except Exception as e:
+        raise PermanentError(f"sendmessage-video rejected: {e}")
+    return resp2
+
+
+def send_file(session, file_path, to_user_id, context_token, client_id=None, file_name=None):
+    """Practical file send v1: getuploadurl (media_type=3) -> upload
+    ciphertext -> sendmessage type=4. Mirrors send_video, except:
+    item is file_item with file_name (basename unless overridden) and
+    len = plaintext size in bytes (upstream UploadedFileInfo.fileSize),
+    NOT the cipher size. 100MiB plain cap mirrored from video as a
+    bridge-side limit (not an upstream-confirmed file cap). No
+    container/type validation: any file under the cap may be sent.
+    Returns sendmessage response. Final-send failure is
+    UnknownDeliveryError (may already be delivered, do NOT auto-retry).
+    Upload failures also surface x-error-code when the server sends one
+    (diagnostic only; observed once as -5102031 on a webm VIDEO upload)."""
+    if not _is_allowed_image_path(file_path):
+        raise PermanentError("send_file: path outside allowed media dirs, refusing")
+    if not os.path.exists(file_path):
+        raise PermanentError("send_file: file missing")
+    with open(file_path, "rb") as f:
+        plain = f.read()
+    if len(plain) > MAX_VIDEO_PLAIN_BYTES:
+        raise PermanentError("send_file: over 100MiB")
+    rawsize = len(plain)
+    rawmd5 = hashlib.md5(plain).hexdigest()
+    filekey = uuid.uuid4().hex
+    key = os.urandom(16)
+    aeskey_hex = key.hex()
+    ciphertext = aes_ecb_encrypt(plain, key)
+    filesize = len(ciphertext)
+    base = session.get("baseurl") or DEFAULT_BASE
+    payload = {"media_type": 3, "rawsize": rawsize, "rawfilemd5": rawmd5,
+               "filesize": filesize, "filekey": filekey, "aeskey": aeskey_hex,
+               "no_need_thumb": True, "base_info": base_info(),
+               "ilink_user_id": session.get("ilink_user_id"),
+               "to_user_id": to_user_id or session.get("ilink_user_id")}
+    try:
+        resp = post_json(base, "/ilink/bot/getuploadurl", payload,
+                         session=session, authenticated=True, timeout=15)
+        check_ret(resp, "getuploadurl")
+    except TokenExpired:
+        raise
+    except ApiError as e:
+        raise RetryableError(f"getuploadurl failed: {e}")
+    data = resp.get("data") if isinstance(resp.get("data"), dict) else resp
+    upload_full_url = data.get("upload_full_url") or resp.get("upload_full_url")
+    upload_param = data.get("upload_param") or resp.get("upload_param")
+    returned_filekey = data.get("filekey") or resp.get("filekey") or filekey
+    if not upload_full_url and upload_param:
+        if isinstance(upload_param, str) and upload_param.startswith("http"):
+            upload_full_url = upload_param
+            if "filekey" not in upload_full_url:
+                sep = "&" if "?" in upload_full_url else "?"
+                upload_full_url = f"{upload_full_url}{sep}filekey={urllib.parse.quote(str(returned_filekey))}"
+        elif isinstance(upload_param, dict) and upload_param.get("url"):
+            upload_full_url = upload_param["url"]
+    if not upload_full_url:
+        raise RetryableError("getuploadurl: no upload_full_url and no usable upload_param")
+    encrypt_param = None
+    error_code = None
+    if shutil.which("curl"):
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False) as tf:
+            tf.write(ciphertext)
+            tmp_path = tf.name
+        hdr_path = tmp_path + ".hdr"
+        try:
+            cmd = ["curl", "-s", "--max-time", "60", "--max-filesize", str(MAX_VIDEO_CIPHER_BYTES),
+                   "-D", hdr_path, "-o", "/dev/null",
+                   "-w", "%{http_code}", "-X", "POST",
+                   "-H", "Content-Type: application/octet-stream",
+                   "--data-binary", f"@{tmp_path}", upload_full_url]
+            try:
+                r = subprocess.run(cmd, capture_output=True, timeout=70)
+            except subprocess.TimeoutExpired:
+                raise RetryableError("upload curl timeout") from None
+            except Exception as e:
+                raise RetryableError(f"upload curl failed: {type(e).__name__}") from None
+            http_code = (r.stdout or b"").decode().strip()
+            try:
+                with open(hdr_path, encoding="utf-8", errors="ignore") as hf:
+                    for line in hf:
+                        if line.lower().startswith("x-encrypted-param:"):
+                            encrypt_param = line.split(":", 1)[1].strip()
+                        elif line.lower().startswith("x-error-code:"):
+                            error_code = line.split(":", 1)[1].strip()
+            except OSError:
+                pass
+            if http_code != "200" or not encrypt_param:
+                raise RetryableError(f"upload failed: http={http_code} x-encrypted-param={'present' if encrypt_param else 'missing'}" + (f" x-error-code={error_code}" if error_code else ""))
+        finally:
+            for pp in (tmp_path, hdr_path):
+                try:
+                    os.remove(pp)
+                except OSError:
+                    pass
+    else:
+        req = urllib.request.Request(upload_full_url, data=ciphertext,
+                                     headers={"Content-Type": "application/octet-stream"},
+                                     method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                if r.status != 200:
+                    raise RetryableError(f"upload http={r.status}")
+                encrypt_param = r.headers.get("x-encrypted-param")
+        except RetryableError:
+            raise
+        except Exception as e:
+            raise RetryableError(f"upload failed: {type(e).__name__}") from None
+        if not encrypt_param:
+            raise RetryableError("upload failed: x-encrypted-param missing")
+    aes_key_b64 = base64.b64encode(aeskey_hex.encode("utf-8")).decode()
+    send_name = file_name or os.path.basename(file_path)
+    msg_payload = {
+        "msg": {
+            "from_user_id": "",
+            "to_user_id": to_user_id or session.get("ilink_user_id"),
+            "client_id": client_id or uuid.uuid4().hex,
+            "message_type": 2,
+            "message_state": 2,
+            "context_token": context_token if context_token is not None else (session.get("context_token") or ""),
+            "item_list": [{"type": 4, "file_item": {
+                "media": {
+                    "encrypt_query_param": encrypt_param.strip() if encrypt_param else encrypt_param,
+                    "aes_key": aes_key_b64,
+                    "encrypt_type": 1,
+                },
+                "file_name": send_name,
+                "len": str(rawsize),
+            }}],
+        },
+        "base_info": base_info(),
+    }
+    try:
+        resp2 = post_json(base, "/ilink/bot/sendmessage", msg_payload,
+                          session=session, authenticated=True, timeout=15, allow_fallback=False)
+    except TokenExpired:
+        raise
+    except Exception as e:
+        raise UnknownDeliveryError(f"sendmessage-file post failed, result unknown: {e}")
+    try:
+        check_ret(resp2, "sendmessage-file")
+    except TokenExpired:
+        raise
+    except Exception as e:
+        raise PermanentError(f"sendmessage-file rejected: {e}")
+    return resp2
 
 
 def write_failure_record(message_id, index, diag, raw_data=None, attempt=None):
@@ -1877,6 +2495,538 @@ def send_image(session, image_path, to_user_id, context_token, client_id=None):
     return resp2
 
 
+import re as _re_local_query
+
+_LOCAL_QUERY_RE = _re_local_query.compile(r"^本地问\s+(\d+)(?:\s*[:：]\s*(.*))?$")
+_LOCAL_DELETE_RE = _re_local_query.compile(r"^本地删\s+(\d+)\s*$")
+_LOCAL_KEEP_RE = _re_local_query.compile(r"^本地留\s+(\d+)\s+(\d+)\s*天?\s*$")
+
+
+def parse_local_query(text):
+    """M3 local follow-up v1: parse '本地问 <message_id>[:问题]'.
+    Returns (video_message_id, question) or None. The question text is
+    NOT used for free-form answering in v1: v1 always returns a
+    deterministic evidence summary, because there is no local LLM and
+    a Worker answer would send the content to Muse, breaking
+    local_only isolation. The question is kept only for logging."""
+    if not text:
+        return None
+    m = _LOCAL_QUERY_RE.match(text.strip())
+    if not m:
+        return None
+    return m.group(1), (m.group(2) or "").strip()
+
+
+def find_local_video(video_message_id):
+    """Return the vault video path for a local video, or None.
+    Only digits are accepted as an id, and the path must stay inside
+    local_vault/<id>/ and be a video_*.mp4 file. No other directory
+    is ever read by a local query."""
+    if not video_message_id or not str(video_message_id).isdigit():
+        return None
+    if is_local_deleted(video_message_id):
+        return None
+    vault = os.path.join(LOCAL_VAULT_DIR, str(video_message_id))
+    if not os.path.isdir(vault):
+        return None
+    for name in sorted(os.listdir(vault)):
+        if name.startswith("video_") and name.endswith(".mp4"):
+            path = os.path.join(vault, name)
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+def build_local_evidence_summary(evidence_path, video_message_id):
+    """Deterministic evidence summary from an m2 evidence.json.
+    No narrative, no speaker identity, no invented content: only
+    duration, completed/uninspected tracks, OCR lines, ASR segments,
+    high Speech/Music windows, and conflicts, capped for WeChat."""
+    try:
+        ev = json.load(open(evidence_path, encoding="utf-8"))
+    except Exception:
+        return None
+    lines = [f"本地视频 {video_message_id} 的证据摘要："]
+    if ev.get("duration_s") is not None:
+        lines.append(f"时长约 {float(ev['duration_s']):.1f} 秒。")
+    comp = ev.get("completed_tracks") or []
+    lines.append("已完成轨道：" + ("、".join(comp) if comp else "无") + "。")
+    un = ev.get("uninspected_ranges") or []
+    if un:
+        lines.append("未检查区间：" + "；".join(f"{u.get('track')}:{u.get('reason')}" for u in un[:5]) + "。")
+    conf = ev.get("conflicts") or []
+    if conf:
+        lines.append(f"冲突 {len(conf)} 条，见证据文件。")
+    ocr = (ev.get("stages") or {}).get("ocr") or {}
+    ocr_lines = []
+    for fr in ocr.get("ocr_frames") or []:
+        for ln in fr.get("lines") or []:
+            ocr_lines.append(f"{fr.get('t_s')}s:{ln}")
+    if ocr_lines:
+        lines.append("画面文字（OCR）：" + "；".join(ocr_lines[:20]) + (f"（共 {len(ocr_lines)} 条）" if len(ocr_lines) > 20 else ""))
+    else:
+        lines.append("画面文字（OCR）：无。")
+    asr = (ev.get("stages") or {}).get("asr") or {}
+    segs = asr.get("segments") or []
+    if segs:
+        lines.append("转写：" + "；".join(f"{seg.get('start_s')}-{seg.get('end_s')}s:{seg.get('text')}" for seg in segs[:20]))
+    else:
+        lines.append("转写：无。")
+    sound = (ev.get("stages") or {}).get("sound") or {}
+    hi = []
+    for row in sound.get("rows") or []:
+        if (row.get("Speech") or 0) >= 0.5 or (row.get("Music") or 0) >= 0.5:
+            hi.append(f"{row.get('start_s')}-{row.get('end_s')}s:{row.get('top1')}")
+    if hi:
+        lines.append("声音高分窗口：" + "；".join(hi[:20]) + "。")
+    text = "\n".join(lines)
+    return text[:1500]
+
+
+def load_pending_local_queries():
+    try:
+        data = json.load(open(PENDING_LOCAL_QUERIES_FILE, encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_pending_local_queries(items):
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        tmp = PENDING_LOCAL_QUERIES_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, PENDING_LOCAL_QUERIES_FILE)
+        return True
+    except Exception:
+        return False
+
+
+def start_local_analysis(video_path, video_message_id):
+    """Launch the M2 analyzer in the background, outdir INSIDE the
+    vault (never analysis/). Returns the outdir, or None on failure.
+    The caller must NOT block serve polling on this process."""
+    outdir = os.path.join(LOCAL_VAULT_DIR, str(video_message_id), "analysis")
+    try:
+        os.makedirs(outdir, exist_ok=True)
+        subprocess.Popen([sys.executable, os.path.join(ROOT, "analyzer", "m2_analyzer.py"),
+                          video_path, outdir],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        return outdir
+    except Exception:
+        return None
+
+
+def move_videos_to_local_vault(message_id, saved_videos):
+    """M3 v1 local_only move: move saved videos from media/inbound into
+    local_vault/<message_id>/ (dir 0700, files 0600). Returns (moved, error).
+    On any failure, the caller must NOT claim local_only: already-moved
+    files stay in the vault, unmoved files stay in media/inbound, and the
+    caller falls back to an explicit failure prompt instead of queuing
+    content. This helper only moves files; it never reads video content
+    and never writes any path into an inbox record."""
+    vault = os.path.join(LOCAL_VAULT_DIR, str(message_id))
+    try:
+        os.makedirs(vault, exist_ok=True)
+        os.chmod(vault, 0o700)
+    except Exception as e:
+        return 0, type(e).__name__
+    moved = 0
+    for idx, saved in enumerate(saved_videos or []):
+        path = saved.get("path") if isinstance(saved, dict) else None
+        if not path or not _is_allowed_image_path(path):
+            return moved, "PATH_NOT_ALLOWED"
+        dest = os.path.join(vault, f"video_{idx}.mp4")
+        try:
+            os.replace(path, dest)
+            os.chmod(dest, 0o600)
+            moved += 1
+        except Exception as e:
+            return moved, type(e).__name__
+    if moved:
+        # TTL registration is best-effort here: if this write fails,
+        # the sweep backfills from the vault dir mtime, so the video
+        # is never left without an expiry.
+        register_local_ttl(message_id)
+    return moved, None
+
+
+def _load_json_dict(path):
+    try:
+        data = json.load(open(path, encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_json_dict_atomic(path, data):
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def load_ttl_index():
+    return _load_json_dict(TTL_INDEX_FILE)
+
+
+def save_ttl_index(data):
+    return _save_json_dict_atomic(TTL_INDEX_FILE, data)
+
+
+def load_tombstones():
+    return _load_json_dict(TOMBSTONE_FILE)
+
+
+def save_tombstones(data):
+    return _save_json_dict_atomic(TOMBSTONE_FILE, data)
+
+
+def is_local_deleted(video_message_id):
+    """Tombstone check: the single anti-resurrection gate. Every read,
+    query, analysis-start and summary-delivery path must call this
+    before touching vault files. A tombstoned id is never usable again,
+    even if a file with that id somehow reappears on disk."""
+    if not video_message_id or not str(video_message_id).isdigit():
+        return False
+    return str(video_message_id) in load_tombstones()
+
+
+def register_local_ttl(video_message_id, received_ts=None):
+    """Register a local video's 48h expiry. Never resets an existing
+    entry (an extension is a separate explicit command), and never
+    registers a tombstoned id. Returns True if an entry now exists."""
+    if not video_message_id or not str(video_message_id).isdigit():
+        return False
+    mid = str(video_message_id)
+    if mid in load_tombstones():
+        return False
+    idx = load_ttl_index()
+    if mid not in idx:
+        now = float(received_ts) if received_ts else time.time()
+        idx[mid] = {"received_ts": now, "expires_ts": now + LOCAL_TTL_SECONDS, "status": "active"}
+        save_ttl_index(idx)
+    return True
+
+
+def delete_local_video_files(video_message_id):
+    """Remove the whole vault dir for one id (video + analysis).
+    Returns True if the dir is gone afterwards."""
+    vault = os.path.join(LOCAL_VAULT_DIR, str(video_message_id))
+    try:
+        if os.path.isdir(vault):
+            shutil.rmtree(vault)
+    except Exception:
+        pass
+    return not os.path.exists(vault)
+
+
+def mark_local_deleted(video_message_id, reason):
+    """Delete order (anti-resurrection): tombstone FIRST, then files.
+    A concurrent reader that checks the tombstone refuses even in the
+    brief window before the files are gone. Returns True if the
+    tombstone is recorded and the vault dir is gone."""
+    if not video_message_id or not str(video_message_id).isdigit():
+        return False
+    mid = str(video_message_id)
+    tombs = load_tombstones()
+    tombs[mid] = {"deleted_ts": time.time(), "reason": reason}
+    save_tombstones(tombs)
+    idx = load_ttl_index()
+    if mid in idx:
+        idx[mid]["status"] = "deleted"
+        save_ttl_index(idx)
+    return delete_local_video_files(mid)
+
+
+def extend_local_ttl(video_message_id, days):
+    """Explicit extension only: new expiry = now + days. Returns
+    (ok, reason) where reason is 'deleted' / 'not_found' / 'range'."""
+    if not video_message_id or not str(video_message_id).isdigit():
+        return False, "not_found"
+    mid = str(video_message_id)
+    if mid in load_tombstones():
+        return False, "deleted"
+    if not (1 <= int(days) <= 30):
+        return False, "range"
+    if find_local_video(mid) is None:
+        return False, "not_found"
+    idx = load_ttl_index()
+    now = time.time()
+    idx[mid] = {"received_ts": idx.get(mid, {}).get("received_ts", now),
+                "expires_ts": now + int(days) * 86400, "status": "active"}
+    save_ttl_index(idx)
+    return True, "ok"
+
+
+def sweep_local_ttl(now=None):
+    """One sweep round, idempotent, called every serve poll loop:
+    (1) backfill ttl entries for vault dirs with no entry, using the
+    dir mtime as the receipt approximation (covers videos saved
+    before this feature, and any register write that failed);
+    (2) expire entries past 48h: tombstone first, then delete files;
+    (3) re-delete any vault dir that reappeared under a tombstoned
+    id (e.g. an analyzer still running when the sweep ran);
+    (4) purge tombstones older than 90 days (a purged id still
+    answers 'not found or deleted', because its files are gone and
+    WeChat message_ids are never reused).
+    Returns the list of message_ids newly expired this round.
+    Pending queries are NOT touched here: the delivery loop sees the
+    tombstone and sends the 'deleted' notice itself, so a notice is
+    never lost by a sweep that runs between analysis and delivery."""
+    now = float(now) if now else time.time()
+    changed_idx = False
+    idx = load_ttl_index()
+    tombs = load_tombstones()
+    try:
+        vault_ids = [d for d in os.listdir(LOCAL_VAULT_DIR)
+                     if d.isdigit() and os.path.isdir(os.path.join(LOCAL_VAULT_DIR, d))]
+    except Exception:
+        vault_ids = []
+    for mid in vault_ids:
+        if mid not in idx and mid not in tombs:
+            try:
+                mtime = os.path.getmtime(os.path.join(LOCAL_VAULT_DIR, mid))
+            except Exception:
+                mtime = now
+            idx[mid] = {"received_ts": mtime, "expires_ts": mtime + LOCAL_TTL_SECONDS, "status": "active"}
+            changed_idx = True
+    expired = []
+    for mid, entry in list(idx.items()):
+        if entry.get("status") == "active" and now >= float(entry.get("expires_ts") or 0):
+            tombs[mid] = {"deleted_ts": now, "reason": "expired"}
+            idx[mid]["status"] = "deleted"
+            changed_idx = True
+            expired.append(mid)
+    if expired or changed_idx:
+        save_tombstones(tombs)
+        save_ttl_index(idx)
+    for mid in list(tombs.keys()):
+        if os.path.isdir(os.path.join(LOCAL_VAULT_DIR, mid)):
+            delete_local_video_files(mid)
+    purged = [m for m, t in list(tombs.items())
+              if now - float(t.get("deleted_ts") or 0) > TOMBSTONE_RETENTION_SECONDS]
+    if purged:
+        for m in purged:
+            tombs.pop(m, None)
+            idx.pop(m, None)
+        save_tombstones(tombs)
+        save_ttl_index(idx)
+    return expired
+
+
+def parse_local_delete(text):
+    if not text:
+        return None
+    m = _LOCAL_DELETE_RE.match(text.strip())
+    return m.group(1) if m else None
+
+
+def parse_local_keep(text):
+    if not text:
+        return None
+    m = _LOCAL_KEEP_RE.match(text.strip())
+    return (m.group(1), int(m.group(2))) if m else None
+
+
+SAFE_VIEW_FILE = os.path.join(STATE, "safe_history_view.json")
+SAFE_VIEW_VERSION = "safe-view-v1"
+SAFE_VIEW_MAX_ROUNDS = 10
+
+_SAFE_VIEW_STATUS_SUFFIXES = (
+    "_queue.json", "_fast.json", "_local.json", "_local_answer.json",
+    "_local_del.json", "_local_keep.json", "_local_fail.json",
+    "_local_deleted.json", "_voice_prompt.json",
+)
+
+
+def classify_outbox_name(name):
+    if name.endswith("_queue.json"):
+        return "queue_receipt"
+    if any(name.endswith(s) for s in _SAFE_VIEW_STATUS_SUFFIXES):
+        return "status_reply"
+    return "formal_answer"
+
+
+def guard_local_path_for_muse(path):
+    if not path:
+        return False
+    try:
+        real = os.path.realpath(path)
+        vault = os.path.realpath(LOCAL_VAULT_DIR)
+        if real == vault or real.startswith(vault + os.sep):
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def build_safe_history_view(max_rounds=SAFE_VIEW_MAX_ROUNDS):
+    tombs = load_tombstones()
+    rounds = []
+    local_placeholders = 0
+    try:
+        done_names = sorted(n for n in os.listdir(DONE) if n.endswith(".json"))
+    except Exception:
+        done_names = []
+    for name in done_names:
+        mid = name[:-5]
+        try:
+            rec = json.load(open(os.path.join(DONE, name), encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("local_only") or mid in tombs:
+            local_placeholders += 1
+            rounds.append({
+                "message_id": mid,
+                "user": {"history_class": "user", "text": "【仅本地视频】" if mid not in tombs else "【本地视频已删除】", "placeholder": True},
+                "answer": {"history_class": "formal_answer", "text": "【仅本地，内容不进入历史】", "placeholder": True},
+            })
+            continue
+        user_text = rec.get("text") or ""
+        if not user_text:
+            if rec.get("images"):
+                user_text = "附图片 %d 张" % len(rec["images"])
+            elif rec.get("source") == "voice":
+                user_text = "【语音】"
+            elif rec.get("videos"):
+                user_text = "附视频 %d 段" % len(rec["videos"])
+        answer_text = None
+        try:
+            sent = json.load(open(os.path.join(OUTBOX_SENT, "%s.json" % mid), encoding="utf-8"))
+            if isinstance(sent, dict):
+                answer_text = sent.get("text")
+        except Exception:
+            answer_text = None
+        rounds.append({
+            "message_id": mid,
+            "user": {"history_class": "user", "text": user_text},
+            "answer": ({"history_class": "formal_answer", "text": answer_text} if answer_text else None),
+        })
+    rounds = rounds[-int(max_rounds):] if max_rounds else rounds
+    queue_count = status_count = 0
+    try:
+        for n in os.listdir(OUTBOX_SENT):
+            if not n.endswith(".json"):
+                continue
+            cls = classify_outbox_name(n)
+            if cls == "queue_receipt":
+                queue_count += 1
+            elif cls == "status_reply":
+                status_count += 1
+    except Exception:
+        pass
+    try:
+        failure_ids = sorted(n[:-5] for n in os.listdir(OUTBOX_FAILED) if n.endswith(".json"))
+    except Exception:
+        failure_ids = []
+    return {
+        "safe_view_version": SAFE_VIEW_VERSION,
+        "max_rounds": int(max_rounds),
+        "rounds": rounds,
+        "rounds_counted": len(rounds),
+        "excluded": {
+            "queue_receipts_total": queue_count,
+            "status_replies_total": status_count,
+            "failure_prompt_ids": failure_ids,
+            "local_placeholders_in_rounds": local_placeholders,
+        },
+        "egress_policy": "safe_view_only",
+    }
+
+
+def refresh_safe_history_view():
+    try:
+        view = build_safe_history_view()
+        try:
+            old = json.load(open(SAFE_VIEW_FILE, encoding="utf-8"))
+            if (isinstance(old, dict) and old.get("rounds") == view["rounds"]
+                    and old.get("excluded") == view["excluded"]):
+                return old
+        except Exception:
+            pass
+        view["generated_ts"] = time.time()
+        if _save_json_dict_atomic(SAFE_VIEW_FILE, view):
+            return view
+        return None
+    except Exception:
+        return None
+
+
+def read_local_only_mode():
+    """M3 v1 toggle: True iff state/local_only_mode.json says enabled.
+    Read fresh on every video so a toggle text takes effect for the next
+    video without restarting serve. Missing/corrupt file means off."""
+    try:
+        with open(LOCAL_ONLY_MODE_FILE, "r", encoding="utf-8") as f:
+            return bool(json.load(f).get("enabled"))
+    except Exception:
+        return False
+
+
+def set_local_only_mode(enabled):
+    """Atomic toggle write (tmp + replace). Returns True on success."""
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        tmp = LOCAL_ONLY_MODE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"enabled": bool(enabled)}, f)
+        os.replace(tmp, LOCAL_ONLY_MODE_FILE)
+        return True
+    except Exception:
+        return False
+
+
+def queue_video_analysis(message_id, saved_videos):
+    """M2 integration v1: spawn the analyzer in the background, never block serve.
+    Only paths already saved by process_inbound_video (under media/) are accepted.
+    The analyzer writes only to analysis/<message_id>_<index>/ (evidence.json,
+    frames/, stage jsons, analyzer.log); it never writes inbox/done/outbox.
+    The inbox record only carries the outdir path + queued status, so the
+    Worker can read evidence.json when it exists; a Worker reply may still
+    arrive before analysis finishes, which is a known v1 limitation, not a
+    guarantee of evidence-before-reply."""
+    analyses = []
+    analyzer = os.path.join(ROOT, "analyzer", "m2_analyzer.py")
+    venv_py = "/home/hatch/workspace/goals/muse-wechat-bridge/hidden_files/m0-component/venv/bin/python"
+    if not os.path.exists(analyzer) or not os.path.exists(venv_py):
+        return analyses
+    for idx, saved in enumerate(saved_videos or []):
+        path = saved.get("path") if isinstance(saved, dict) else None
+        if not path or not _is_allowed_image_path(path):
+            continue
+        if not guard_local_path_for_muse(path) or is_local_deleted(message_id):
+            continue
+        outdir = os.path.join(ANALYSIS_DIR, f"{message_id}_{idx}")
+        try:
+            os.makedirs(outdir, exist_ok=True)
+            log_path = os.path.join(outdir, "analyzer.log")
+            logf = open(log_path, "ab")
+            try:
+                subprocess.Popen([venv_py, analyzer, path, outdir],
+                                 stdout=logf, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL,
+                                 start_new_session=True, close_fds=True)
+            finally:
+                logf.close()
+            analyses.append({"video_index": idx, "outdir": outdir, "status": "queued"})
+        except Exception as e:
+            analyses.append({"video_index": idx, "outdir": outdir, "status": "queue_failed",
+                             "error": type(e).__name__})
+    return analyses
+
+
 def send_text(session, text, to_user_id=None, context_token=None, client_id=None):
     """Send one text message. Returns the parsed response on success.
     Audit 3: post failure during final sendmessage = UnknownDeliveryError
@@ -2100,8 +3250,12 @@ def drain_outbox(session):
             try:
                 if not _state_ok:
                     raise RuntimeError("sending-state write failed")
-                send_image(session, att_path, job.get("to_user_id"), job.get("context_token"),
-                           client_id=att.get("client_id"))
+                if att.get("type") == "video":
+                    send_video(session, att_path, job.get("to_user_id"), job.get("context_token"),
+                               client_id=att.get("client_id"))
+                else:
+                    send_image(session, att_path, job.get("to_user_id"), job.get("context_token"),
+                               client_id=att.get("client_id"))
                 att["status"] = "sent"
                 att.pop("error", None)
                 changed = True
@@ -2116,7 +3270,7 @@ def drain_outbox(session):
                     if att["attempts"] >= 3:
                         att["status"] = "failed"
                 changed = True
-                print(f"outbox: image {status} for {name}: {_sanitize_error(e)}", flush=True)
+                print(f"outbox: {att.get('type') or 'image'} {status} for {name}: {_sanitize_error(e)}", flush=True)
         if attachments:
             job["attachments"] = attachments
         all_sent = (not text or job.get("text_status") == "sent") and all(
@@ -2340,6 +3494,64 @@ def serve_loop():
             return 14
         except Exception as e:
             print(f"serve: outbox drain error (continuing): {e}", flush=True)
+        # TTL sweep: every poll loop, before any local delivery, so an
+        # expired video can never be summarized after its deadline.
+        try:
+            sweep_local_ttl()
+        except Exception as _sweep_e:
+            print(f"serve: ttl sweep error (continuing): {_sweep_e}", flush=True)
+        try:
+            refresh_safe_history_view()
+        except Exception as _sv_e:
+            print(f"serve: safe view refresh error (continuing): {_sv_e}", flush=True)
+        # M3 local follow-up v1: deliver completed local analyses.
+        # This runs every poll loop, never blocks on analysis, and never
+        # routes local content through the Worker.
+        _pend = load_pending_local_queries()
+        if _pend:
+            _remain = []
+            _pend_changed = False
+            for _q in _pend:
+                if is_local_deleted(_q.get("video_mid")):
+                    # Anti-resurrection: a deleted video's summary is
+                    # never delivered, even if an evidence file reappears.
+                    try:
+                        _ok = send_direct_or_outbox(session, "该本地视频已删除，证据摘要不再可用。", _q.get("to_user_id") or session.get("ilink_user_id"), _q.get("context_token") or "", f"{_q.get('query_mid')}_local_deleted.json")
+                    except TokenExpired:
+                        _sender_stop.set()
+                        print("serve: token expired during local deleted notice, stopping.", flush=True)
+                        return 14
+                    if _ok:
+                        _pend_changed = True
+                        continue
+                    _remain.append(_q)
+                    continue
+                _evp = os.path.join(_q.get("outdir", ""), "evidence.json")
+                if os.path.exists(_evp):
+                    _summ = build_local_evidence_summary(_evp, _q.get("video_mid"))
+                    if _summ:
+                        try:
+                            _ok = send_direct_or_outbox(session, _summ, _q.get("to_user_id") or session.get("ilink_user_id"), _q.get("context_token") or "", f"{_q.get('query_mid')}_local_answer.json")
+                        except TokenExpired:
+                            _sender_stop.set()
+                            print("serve: token expired during local answer, stopping.", flush=True)
+                            return 14
+                        if _ok:
+                            _pend_changed = True
+                            continue
+                    _remain.append(_q)
+                elif time.time() - float(_q.get("started_ts") or 0) > 1800:
+                    try:
+                        send_direct_or_outbox(session, "本地分析超时或失败，请重发本地问。", _q.get("to_user_id") or session.get("ilink_user_id"), _q.get("context_token") or "", f"{_q.get('query_mid')}_local_fail.json")
+                    except TokenExpired:
+                        _sender_stop.set()
+                        print("serve: token expired during local fail, stopping.", flush=True)
+                        return 14
+                    _pend_changed = True
+                else:
+                    _remain.append(_q)
+            if _pend_changed:
+                save_pending_local_queries(_remain)
         cursor = load_cursor()
         base = session.get("baseurl") or DEFAULT_BASE
         try:
@@ -2380,7 +3592,21 @@ def serve_loop():
             if voice_text:
                 text = (text + voice_text) if text else voice_text
             image_items = extract_images(msg)
-            if not text and not is_voice_only and not image_items:
+            video_items = extract_video_items(msg)
+            # M3 v1 toggle (WeChat videos carry no caption, so a caption
+            # trigger alone cannot work): a text message "仅本地" or
+            # "开启仅本地" turns local-only mode ON for all following videos;
+            # "关闭仅本地" turns it OFF. The toggle message itself is a
+            # normal text message (its reply confirms the mode); only videos
+            # arriving while the mode is on are diverted to local_vault.
+            _toggle = (text or "").strip()
+            if _toggle in ("仅本地", "开启仅本地"):
+                set_local_only_mode(True)
+                print("serve: local-only mode ON", flush=True)
+            elif _toggle == "关闭仅本地":
+                set_local_only_mode(False)
+                print("serve: local-only mode OFF", flush=True)
+            if not text and not is_voice_only and not image_items and not video_items:
                 continue
             mid = str(msg.get("message_id"))
             if mid in processed:
@@ -2396,6 +3622,101 @@ def serve_loop():
             ctx = msg.get("context_token") or ""
             if ctx:
                 session["context_token"] = ctx
+            # M3 local follow-up v1: '本地问 <message_id>' is intercepted
+            # here, never queued to inbox, never seen by the Worker.
+            # v1 returns a deterministic evidence summary only.
+            # TTL v1 commands, same interception as local queries: never
+            # queued to inbox, never seen by the Worker.
+            _local_del = parse_local_delete(text) if text else None
+            if _local_del is not None:
+                if is_local_deleted(_local_del):
+                    _reply = "该本地视频已删除，无需重复删除。"
+                elif find_local_video(_local_del) is None:
+                    _reply = "本地视频不存在或已删除，请确认消息号是否正确。"
+                else:
+                    mark_local_deleted(_local_del, "manual")
+                    _reply = f"本地视频 {_local_del} 已删除，证据与分析文件已一并清除。"
+                try:
+                    _queued = send_direct_or_outbox(session, _reply, session.get("ilink_user_id"), ctx, f"{mid}_local_del.json")
+                except TokenExpired:
+                    print("serve: token expired during local delete, stopping.", flush=True)
+                    return 14
+                if not _queued:
+                    _batch_enqueue_failed = True
+                    print(f"serve: local delete reply queue FAILED for {mid}, NOT marking processed, will retry", flush=True)
+                    continue
+                processed.add(mid); save_processed(processed)
+                print(f"serve: local delete for {mid} -> video {_local_del}", flush=True)
+                continue
+            _local_keep = parse_local_keep(text) if text else None
+            if _local_keep is not None:
+                _keep_mid, _keep_days = _local_keep
+                _ok, _reason = extend_local_ttl(_keep_mid, _keep_days)
+                if _reason == "deleted":
+                    _reply = "该本地视频已删除，无法延长。"
+                elif _reason == "range":
+                    _reply = "延长天数须在 1 到 30 天之间。"
+                elif not _ok:
+                    _reply = "本地视频不存在或已删除，请确认消息号是否正确。"
+                else:
+                    _reply = f"本地视频 {_keep_mid} 已延长 {_keep_days} 天（从现在起算）。"
+                try:
+                    _queued = send_direct_or_outbox(session, _reply, session.get("ilink_user_id"), ctx, f"{mid}_local_keep.json")
+                except TokenExpired:
+                    print("serve: token expired during local keep, stopping.", flush=True)
+                    return 14
+                if not _queued:
+                    _batch_enqueue_failed = True
+                    print(f"serve: local keep reply queue FAILED for {mid}, NOT marking processed, will retry", flush=True)
+                    continue
+                processed.add(mid); save_processed(processed)
+                print(f"serve: local keep for {mid} -> video {_keep_mid} +{_keep_days}d", flush=True)
+                continue
+            _local_q = parse_local_query(text) if text else None
+            if _local_q is not None:
+                _video_mid, _q_text = _local_q
+                if is_local_deleted(_video_mid):
+                    _reply = "该本地视频已删除，证据摘要不再可用。"
+                    try:
+                        _queued = send_direct_or_outbox(session, _reply, session.get("ilink_user_id"), ctx, f"{mid}_local.json")
+                    except TokenExpired:
+                        print("serve: token expired during local query, stopping.", flush=True)
+                        return 14
+                    if not _queued:
+                        _batch_enqueue_failed = True
+                        print(f"serve: local query reply queue FAILED for {mid}, NOT marking processed, will retry", flush=True)
+                        continue
+                    processed.add(mid); save_processed(processed)
+                    print(f"serve: local query for {mid} -> deleted video {_video_mid}", flush=True)
+                    continue
+                _vpath = find_local_video(_video_mid)
+                if _vpath is None:
+                    _reply = "本地视频不存在或已删除，请确认消息号是否正确。"
+                else:
+                    _evp = os.path.join(LOCAL_VAULT_DIR, _video_mid, "analysis", "evidence.json")
+                    if os.path.exists(_evp):
+                        _reply = build_local_evidence_summary(_evp, _video_mid) or "本地证据读取失败，请重发本地问。"
+                    else:
+                        _outdir = start_local_analysis(_vpath, _video_mid)
+                        if _outdir is None:
+                            _reply = "本地分析启动失败，请重发本地问。"
+                        else:
+                            _pend = [q for q in load_pending_local_queries() if q.get("video_mid") != _video_mid]
+                            _pend.append({"query_mid": mid, "video_mid": _video_mid, "outdir": _outdir, "to_user_id": session.get("ilink_user_id"), "context_token": ctx, "started_ts": time.time()})
+                            save_pending_local_queries(_pend)
+                            _reply = "本地分析正在跑，跑完我把证据摘要发你，不用重发。"
+                try:
+                    _queued = send_direct_or_outbox(session, _reply, session.get("ilink_user_id"), ctx, f"{mid}_local.json")
+                except TokenExpired:
+                    print("serve: token expired during local query, stopping.", flush=True)
+                    return 14
+                if not _queued:
+                    _batch_enqueue_failed = True
+                    print(f"serve: local query reply queue FAILED for {mid}, NOT marking processed, will retry", flush=True)
+                    continue
+                processed.add(mid); save_processed(processed)
+                print(f"serve: local query for {mid} -> video {_video_mid}", flush=True)
+                continue
             # Phase 2 step 3: fast commands, direct reply, no inbox, no Worker.
             fast = fast_command_reply(text) if text else None
             if fast is not None:
@@ -2496,18 +3817,111 @@ def serve_loop():
                 processed.add(mid); save_processed(processed)
                 print(f"serve: image fail prompt for {mid}.json", flush=True)
                 continue
+            # Practical video receive v1: process videos like images.
+            # Download/decrypt failure never blocks the main loop;
+            # decrypt failure never saves ciphertext as plaintext.
+            saved_videos = []
+            video_errors = []
+            for idx, vi in enumerate(video_items):
+                try:
+                    saved, err, diag = process_inbound_video(vi, mid, idx)
+                except Exception as e:
+                    saved, err, diag = None, _sanitize_error(e), None
+                if saved:
+                    saved_videos.append(saved)
+                else:
+                    video_errors.append({"index": idx, "error": err,
+                                         "error_code": (diag or {}).get("error_code")})
+            if video_items and not saved_videos and not text:
+                # All videos failed and no text: explicit prompt, no inbox.
+                print(f"serve: video fail for {mid}.json errors={video_errors}", flush=True)
+                try:
+                    _queued = send_direct_or_outbox(session, "视频接收失败，请重发",
+                                          session.get("ilink_user_id"), ctx,
+                                          f"{mid}_video_fail.json")
+                except TokenExpired:
+                    print("serve: video fail prompt, stopping.", flush=True)
+                    return 14
+                if not _queued:
+                    _batch_enqueue_failed = True
+                    print(f"serve: video fail prompt queue FAILED for {mid}, NOT marking processed, will retry", flush=True)
+                    continue
+                processed.add(mid); save_processed(processed)
+                print(f"serve: video fail prompt for {mid}.json", flush=True)
+                continue
+            # M3 defect fix: decide local_only intent BEFORE queueing analysis.
+            # A local_only video must never be queued into analysis/ at all:
+            # previously the queue ran first and the analyzer failed only
+            # because the file had already been moved to local_vault, leaving
+            # a stray analysis dir. Intent uses caption OR toggle mode, same
+            # rule as the move step below, and does not depend on saved files.
+            _local_only_intent = bool(video_items and ("仅本地" in (text or "") or read_local_only_mode()))
+            # M2 integration v1: queue background analysis (non-blocking),
+            # skipped entirely for local_only videos.
+            video_analyses = queue_video_analysis(mid, saved_videos) if (saved_videos and not _local_only_intent) else []
+            # M3 v1 local_only: caption contains exactly "仅本地" and at least one
+            # video was saved. Move files to local_vault, do NOT queue analysis
+            # into analysis/, and do NOT put any video path, analysis path or
+            # original text into the inbox record (see record construction below).
+            # Fail-safe: any move failure -> explicit failure prompt, no content queued.
+            is_local_only = bool(_local_only_intent and saved_videos)
+            local_video_count = 0
+            if is_local_only:
+                _moved, _merr = move_videos_to_local_vault(mid, saved_videos)
+                if _merr is not None or _moved != len(saved_videos):
+                    print(f"serve: local vault move FAILED for {mid}, moved={_moved} err={_merr}", flush=True)
+                    try:
+                        _queued = send_direct_or_outbox(session, "仅本地保存失败，请重发",
+                                              session.get("ilink_user_id"), ctx,
+                                              f"{mid}_local_fail.json")
+                    except TokenExpired:
+                        print("serve: local fail prompt, stopping.", flush=True)
+                        return 14
+                    if not _queued:
+                        _batch_enqueue_failed = True
+                        print(f"serve: local fail prompt queue FAILED for {mid}, NOT marking processed, will retry", flush=True)
+                        continue
+                    processed.add(mid); save_processed(processed)
+                    print(f"serve: local fail prompt for {mid}.json", flush=True)
+                    continue
+                local_video_count = _moved
+                saved_videos = []
+                video_analyses = []
             # Normal queued task (text, voice with transcription, and/or images).
+            # Quote v1: resolve any upstream ref_msg here so the Worker sees
+            # the quoted target instead of guessing from history. Local or
+            # tombstoned targets resolve to a guard only, never content.
+            quote = resolve_quote(extract_quote(msg))
             record = {
                 "message_id": msg.get("message_id"),
                 "text": text,
                 "from_user_id": msg.get("from_user_id"),
                 "context_token": ctx,
                 "ts": msg.get("create_time_ms") or int(time.time() * 1000),
+                "history_class": "user",
+                "egress_policy": "muse_default",
+                "policy_version": SAFE_VIEW_VERSION,
             }
+            if quote:
+                record["quote"] = quote
             if voice_text:
                 record["source"] = "voice"
             if saved_images:
                 record["images"] = saved_images
+            if is_local_only:
+                # Placeholder only: no video path, no analysis path, no original text.
+                record["egress_policy"] = "local_only"
+                record["local_only"] = True
+                record["local_video_count"] = local_video_count
+                record["local_only_note"] = "仅本地保存"
+                record["text"] = ""
+            else:
+                if saved_videos:
+                    record["videos"] = saved_videos
+                if video_analyses:
+                    record["analysis"] = video_analyses
+                if video_errors:
+                    record["video_errors"] = video_errors
             if image_errors:
                 record["image_errors"] = image_errors
             # Associator blocking: if this text is a follow-up about
@@ -2848,6 +4262,7 @@ def main(argv=None):
     p_send.add_argument("--client-id", default=None)
     sub.add_parser("status", help="Show bridge state without printing secrets")
     sub.add_parser("verify-channel", help="Production Worker channel-recovery check (read-only JSON, exit 0 only if recovered)")
+    sub.add_parser("safe-view", help="Print the deterministic safe history view (read-only JSON)")
     args = parser.parse_args(argv)
     ensure_dirs()
     if args.cmd == "login":
@@ -2856,6 +4271,10 @@ def main(argv=None):
         return serve_loop()
     if args.cmd == "status":
         return cmd_status(args)
+    if args.cmd == "safe-view":
+        view = build_safe_history_view()
+        print(json.dumps(view, ensure_ascii=False, indent=2))
+        return 0
     if args.cmd == "verify-channel":
         return cmd_verify_channel(args)
     if args.cmd == "send":
