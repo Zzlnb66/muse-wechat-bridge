@@ -19,7 +19,7 @@ import sys
 # R2 P0 F2-lite: overridable via environment, default unchanged.
 # Used with plain string concatenation below, so normalise the
 # trailing slash for an env-supplied value.
-BASE = os.environ.get("WECHAT_BRIDGE_ANALYZER_BASE", "/home/hatch/workspace/goals/muse-wechat-bridge/hidden_files/")
+BASE = os.environ.get("WECHAT_BRIDGE_ANALYZER_BASE") or "/home/hatch/workspace/goals/muse-wechat-bridge/hidden_files/"
 if not BASE.endswith("/"):
     BASE += "/"
 

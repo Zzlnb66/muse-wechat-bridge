@@ -93,7 +93,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 # R2 P0 F2-lite: overridable via environment, default unchanged,
 # so the production install keeps working with no config change.
-VENV_PY = os.environ.get("WECHAT_BRIDGE_ANALYZER_PY", "/home/hatch/workspace/goals/muse-wechat-bridge/hidden_files/m0-component/venv/bin/python")
+VENV_PY = os.environ.get("WECHAT_BRIDGE_ANALYZER_PY") or "/home/hatch/workspace/goals/muse-wechat-bridge/hidden_files/m0-component/venv/bin/python"
 
 
 def sha256_file(path):
