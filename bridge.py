@@ -96,7 +96,6 @@ PENDING_LOCAL_QUERIES_FILE = os.path.join(STATE, "pending_local_queries.json")
 TTL_INDEX_FILE = os.path.join(STATE, "local_ttl_index.json")
 TOMBSTONE_FILE = os.path.join(STATE, "local_tombstones.json")
 LOCAL_TTL_SECONDS = 48 * 3600
-TOMBSTONE_RETENTION_SECONDS = 90 * 86400
 MEDIA_OUTBOUND = os.path.join(ROOT, "media", "outbound")
 FAILURES_DIR = os.path.join(ROOT, "failures")
 IMAGE_EVENT_FILE = os.path.join(STATE, "last_image_event.json")
@@ -880,7 +879,17 @@ def resolve_quote(quote):
 
     NEVER returns quoted text, title, or media info for a local-only or
     tombstoned target: the quoted target's content must not be resurrected
-    through a quote. Unknown targets are marked unresolved, never guessed."""
+    through a quote. Unknown targets are marked unresolved, never guessed.
+    R2 evaluation note (2026-10-31): R2 proposed banning the inline
+    fallback for unknown ids outright, but that would break tested
+    quote-v1 cases 5/10 (a pre-bridge message quoted with platform
+    inline text, where there is no bridge record at all). The
+    protection against a deleted id aging into 'unknown' is instead
+    the permanent tombstone set (sweep_local_ttl never purges), so a
+    local-only/deleted id can never lose its guard. Unknown-id
+    inline text therefore only ever comes from messages the bridge
+    never handled, supplied by the platform in the quoting message
+    itself, not from resurrected local content."""
     if not quote:
         return None
     qid = quote.get("quoted_message_id")
@@ -2776,9 +2785,10 @@ def sweep_local_ttl(now=None):
     (2) expire entries past 48h: tombstone first, then delete files;
     (3) re-delete any vault dir that reappeared under a tombstoned
     id (e.g. an analyzer still running when the sweep ran);
-    (4) purge tombstones older than 90 days (a purged id still
-    answers 'not found or deleted', because its files are gone and
-    WeChat message_ids are never reused).
+    (4) R2 P0: tombstones are NEVER purged. The file holds only
+    a minimal id set (deleted_ts + reason, no content), so keeping
+    it forever costs nothing and guarantees a deleted id can never
+    age back into 'unknown' and regain an inline-text fallback.
     Returns the list of message_ids newly expired this round.
     Pending queries are NOT touched here: the delivery loop sees the
     tombstone and sends the 'deleted' notice itself, so a notice is
@@ -2813,14 +2823,7 @@ def sweep_local_ttl(now=None):
     for mid in list(tombs.keys()):
         if os.path.isdir(os.path.join(LOCAL_VAULT_DIR, mid)):
             delete_local_video_files(mid)
-    purged = [m for m, t in list(tombs.items())
-              if now - float(t.get("deleted_ts") or 0) > TOMBSTONE_RETENTION_SECONDS]
-    if purged:
-        for m in purged:
-            tombs.pop(m, None)
-            idx.pop(m, None)
-        save_tombstones(tombs)
-        save_ttl_index(idx)
+    # R2 P0: no tombstone purge (see docstring step 4).
     return expired
 
 
@@ -2999,7 +3002,8 @@ def queue_video_analysis(message_id, saved_videos):
     guarantee of evidence-before-reply."""
     analyses = []
     analyzer = os.path.join(ROOT, "analyzer", "m2_analyzer.py")
-    venv_py = "/home/hatch/workspace/goals/muse-wechat-bridge/hidden_files/m0-component/venv/bin/python"
+    # R2 P0 F2-lite: same override variable as analyzer/m2_analyzer.py.
+    venv_py = os.environ.get("WECHAT_BRIDGE_ANALYZER_PY", "/home/hatch/workspace/goals/muse-wechat-bridge/hidden_files/m0-component/venv/bin/python")
     if not os.path.exists(analyzer) or not os.path.exists(venv_py):
         return analyses
     for idx, saved in enumerate(saved_videos or []):
@@ -3190,6 +3194,12 @@ def drain_outbox(session):
         if not job.get("to_user_id") and session.get("ilink_user_id"):
             job["to_user_id"] = session.get("ilink_user_id")
             changed = True
+        # R2 P0 (B2-lite): the bridge session owns context_token.
+        # A pending job may still carry a Worker-copied token from
+        # the old contract; prefer the live session token and fall
+        # back to the job's only during transition, so the Worker
+        # never needs to handle a platform token at all.
+        _job_token = session.get("context_token") or job.get("context_token")
         # Ensure persisted client_ids before any send.
         if text and not job.get("client_id"):
             job["client_id"] = uuid.uuid4().hex
@@ -3212,7 +3222,7 @@ def drain_outbox(session):
                 if not _state_ok:
                     raise RuntimeError("sending-state write failed")
                 send_text(session, text, to_user_id=job.get("to_user_id"),
-                          context_token=job.get("context_token"),
+                          context_token=_job_token,
                           client_id=job.get("client_id"))
                 job["text_status"] = "sent"
                 job["delivery_state"] = "sent"
@@ -3250,12 +3260,23 @@ def drain_outbox(session):
             try:
                 if not _state_ok:
                     raise RuntimeError("sending-state write failed")
-                if att.get("type") == "video":
-                    send_video(session, att_path, job.get("to_user_id"), job.get("context_token"),
+                # R2 P0 F1: explicit dispatch. A file attachment
+                # must NEVER fall through to send_image, and an
+                # unknown type must NEVER be guessed: legacy jobs
+                # without a type are images (the pre-type schema),
+                # anything else unknown is a permanent failure.
+                _att_type = att.get("type")
+                if _att_type == "video":
+                    send_video(session, att_path, job.get("to_user_id"), _job_token,
+                               client_id=att.get("client_id"))
+                elif _att_type == "file":
+                    send_file(session, att_path, job.get("to_user_id"), _job_token,
+                              client_id=att.get("client_id"))
+                elif _att_type in (None, "image"):
+                    send_image(session, att_path, job.get("to_user_id"), _job_token,
                                client_id=att.get("client_id"))
                 else:
-                    send_image(session, att_path, job.get("to_user_id"), job.get("context_token"),
-                               client_id=att.get("client_id"))
+                    raise PermanentError(f"unknown attachment type: {_att_type!r}")
                 att["status"] = "sent"
                 att.pop("error", None)
                 changed = True
@@ -3313,6 +3334,15 @@ def drain_outbox(session):
             _IN_MEMORY_HALTED_FILES.add(name)
             print(f"outbox: HALTED {name} after post-send write failure, will not auto-resend", flush=True)
             continue
+        # R2 P0 (B2-lite): never archive a platform token into
+        # sent/ or failed/, where the Worker could read it back.
+        # Best effort only: a scrub-write failure must not block
+        # delivery of an already-sent job.
+        if job.pop("context_token", None) is not None:
+            try:
+                atomic_write_json(path, job, mode=0o600)
+            except Exception as _scrub_e:
+                print(f"outbox: token scrub write failed for {name}: {_sanitize_error(_scrub_e)}", flush=True)
         if all_sent:
             os.replace(path, os.path.join(OUTBOX_SENT, name))
             sent_names.append(name)
@@ -3892,11 +3922,15 @@ def serve_loop():
             # the quoted target instead of guessing from history. Local or
             # tombstoned targets resolve to a guard only, never content.
             quote = resolve_quote(extract_quote(msg))
+            # R2 P0 (B2-lite): the inbox/done record is Worker-
+            # visible, so it must NOT carry context_token. The
+            # bridge session already holds ctx (updated above from
+            # the inbound message), and drain_outbox sends with the
+            # session token, so nothing needs the token from here.
             record = {
                 "message_id": msg.get("message_id"),
                 "text": text,
                 "from_user_id": msg.get("from_user_id"),
-                "context_token": ctx,
                 "ts": msg.get("create_time_ms") or int(time.time() * 1000),
                 "history_class": "user",
                 "egress_policy": "muse_default",
