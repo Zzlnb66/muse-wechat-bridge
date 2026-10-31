@@ -2620,38 +2620,249 @@ def save_pending_local_queries(items):
 
 
 DEFAULT_ANALYZER_PY = "/home/hatch/workspace/goals/muse-wechat-bridge/hidden_files/m0-component/venv/bin/python"
+ANALYZER_RUNS_FILE = os.path.join(STATE, "analyzer_runs.json")
+
+
+def _resolve_candidate(candidate):
+    """Resolve one interpreter candidate to an executable path, or None.
+
+    A value containing a separator is a path (relative ones resolve
+    under ROOT); a bare name goes through shutil.which. Existence alone
+    is NOT enough: the candidate must actually execute `python -c`
+    successfully within 5 s. This is the item-1 fix for the old bug
+    where a merely-existing path was trusted and a bad value was then
+    re-read by the analyzer child through the inherited environment."""
+    import shutil
+    if not candidate:
+        return None
+    if os.sep in candidate:
+        path = candidate if os.path.isabs(candidate) else os.path.join(ROOT, candidate)
+    else:
+        path = shutil.which(candidate)
+    if not path:
+        return None
+    try:
+        r = subprocess.run([path, "-c", "import sys; print(sys.executable)"],
+                           capture_output=True, timeout=5)
+        return path if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _resolve_analyzer_runtime():
+    """Validated analyzer interpreter selection (item 1, 2026-10-31).
+
+    Order: non-empty explicit config -> default venv -> bridge's own
+    interpreter. Each candidate must actually execute; the first usable
+    one wins. Returns (path, reason); path is None when nothing runs.
+    The selected path is passed to the analyzer child via the
+    environment, so the child can never re-read a stale invalid value,
+    and stages run under the analyzer's own sys.executable."""
+    candidates = []
+    explicit = os.environ.get("WECHAT_BRIDGE_ANALYZER_PY") or ""
+    if explicit:
+        candidates.append((explicit, "explicit"))
+    candidates.append((DEFAULT_ANALYZER_PY, "default_venv"))
+    candidates.append((sys.executable, "bridge_python"))
+    seen = set()
+    for cand, reason in candidates:
+        if cand in seen:
+            continue
+        seen.add(cand)
+        resolved = _resolve_candidate(cand)
+        if resolved:
+            return resolved, reason
+    return None, "no_usable_runtime"
 
 
 def _resolve_analyzer_py():
-    """Analyzer parent interpreter: WECHAT_BRIDGE_ANALYZER_PY wins, an
-    empty value counts as unset, otherwise the m0 venv default. The
-    model stages always run under this same variable inside
-    analyzer/m2_analyzer.py, so both launch paths share one env."""
-    return os.environ.get("WECHAT_BRIDGE_ANALYZER_PY") or DEFAULT_ANALYZER_PY
+    """Backward-compatible wrapper: validated selected path, or None."""
+    path, _reason = _resolve_analyzer_runtime()
+    return path
+
+
+def _load_analyzer_runs():
+    try:
+        with open(ANALYZER_RUNS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_analyzer_runs(runs):
+    try:
+        atomic_write_json(ANALYZER_RUNS_FILE, runs, mode=0o600)
+    except Exception as e:
+        print(f"analyzer runs registry write failed: {_sanitize_error(e)}", flush=True)
+
+
+def _analyzer_run_alive(entry):
+    """Identity-checked liveness: pid alive AND boot_id AND
+    proc_starttime match, and not a zombie. A PID reused by an
+    unrelated process must never be treated as our run, and a zombie
+    (kill(pid, 0) still succeeds on it) must not read as alive."""
+    pid = entry.get("pid")
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            stat = f.read()
+        if stat.rsplit(")", 1)[1].split()[0] == "Z":
+            return False
+    except Exception:
+        return False
+    if entry.get("boot_id") != _boot_id():
+        return False
+    try:
+        if _proc_starttime(pid) != entry.get("proc_starttime"):
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _find_live_run_by_outdir(outdir):
+    """Live registered run for an outdir, or None. Stale entries for
+    that outdir are purged so a later launch is not blocked by a dead
+    run."""
+    runs = _load_analyzer_runs()
+    found = None
+    changed = False
+    for rid, entry in list(runs.items()):
+        if entry.get("outdir") == outdir:
+            if _analyzer_run_alive(entry):
+                found = (rid, entry)
+            else:
+                del runs[rid]
+                changed = True
+    if changed:
+        _save_analyzer_runs(runs)
+    return found
+
+
+def _register_analyzer_run(run_id, outdir, video_key, pid, python):
+    runs = _load_analyzer_runs()
+    runs[run_id] = {"outdir": outdir, "video_key": video_key, "pid": pid,
+                    "python": python, "boot_id": _boot_id(),
+                    "proc_starttime": _proc_starttime(pid),
+                    "started_ts": time.time()}
+    _save_analyzer_runs(runs)
+
+
+def _kill_analyzer_runs(video_key=None, outdir=None):
+    """Stop analyzer trees for a deleted video. Identity-checked; a PID
+    that fails the check is never killed. Returns killed run_ids."""
+    import signal
+    runs = _load_analyzer_runs()
+    killed = []
+    changed = False
+    for rid, entry in list(runs.items()):
+        match = (video_key is not None and entry.get("video_key") == video_key) or \
+                (outdir is not None and entry.get("outdir") == outdir)
+        if not match:
+            continue
+        pid = entry.get("pid")
+        if pid and _analyzer_run_alive(entry):
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except Exception:
+                pass
+            for _ in range(5):
+                time.sleep(0.1)
+                if not _analyzer_run_alive(entry):
+                    break
+            else:
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+            killed.append(rid)
+        del runs[rid]
+        changed = True
+    if changed:
+        _save_analyzer_runs(runs)
+    return killed
+
+
+def _launch_analyzer(video, outdir, video_key, stdout, stderr):
+    """Unified analyzer launcher (item 1). Dedupe by outdir: a live run
+    for the same outdir is reused, never duplicated. The selected
+    interpreter is validated by execution and passed to the child via
+    the environment, so stages (which use the analyzer's own
+    sys.executable) can never re-read a stale invalid value.
+    Returns {"outdir", "run_id", "python", "reason"} or
+    {"status": "runtime_unavailable"/"launch_failed", "reason"}."""
+    live = _find_live_run_by_outdir(outdir)
+    if live:
+        rid, entry = live
+        return {"outdir": outdir, "run_id": rid, "python": entry.get("python"),
+                "reason": "reused_live_run"}
+    selected, reason = _resolve_analyzer_runtime()
+    if not selected:
+        print("analyzer: no usable runtime, refusing launch", flush=True)
+        return {"status": "runtime_unavailable", "reason": reason}
+    run_id = "run-%d-%s" % (time.time_ns(), uuid.uuid4().hex[:8])
+    env = dict(os.environ)
+    env["WECHAT_BRIDGE_ANALYZER_PY"] = selected
+    analyzer_script = os.path.join(ROOT, "analyzer", "m2_analyzer.py")
+    try:
+        proc = subprocess.Popen([selected, analyzer_script, video, outdir,
+                                 "--run-id", run_id],
+                                stdout=stdout, stderr=stderr,
+                                stdin=subprocess.DEVNULL,
+                                env=env,
+                                start_new_session=True, close_fds=True)
+    except Exception as e:
+        print(f"analyzer: launch failed: {_sanitize_error(e)}", flush=True)
+        return {"status": "launch_failed", "reason": type(e).__name__}
+    _register_analyzer_run(run_id, outdir, video_key, proc.pid, selected)
+    return {"outdir": outdir, "run_id": run_id, "python": selected, "reason": reason}
 
 
 def start_local_analysis(video_path, video_message_id):
     """Launch the M2 analyzer in the background, outdir INSIDE the
-    vault (never analysis/). Returns the outdir, or None on failure.
+    vault (never analysis/). Returns {"outdir", "run_id"} or None.
     The caller must NOT block serve polling on this process.
-    GPT follow-up 2026-10-31: this path used to hard-code
-    sys.executable while queue_video_analysis used the env override;
-    both now resolve through _resolve_analyzer_py, falling back to
-    sys.executable only when the env value points nowhere."""
+    Item 1 (2026-10-31): unified launcher shared with
+    queue_video_analysis; a live run for the same outdir is reused
+    instead of spawning a duplicate that would race on evidence.json.
+    Returns None when no usable runtime exists or launch fails."""
     outdir = os.path.join(LOCAL_VAULT_DIR, str(video_message_id), "analysis")
-    analyzer_py = _resolve_analyzer_py()
-    if not os.path.exists(analyzer_py):
-        print(f"local_analysis: analyzer python not found, falling back to sys.executable", flush=True)
-        analyzer_py = sys.executable
     try:
         os.makedirs(outdir, exist_ok=True)
-        subprocess.Popen([analyzer_py, os.path.join(ROOT, "analyzer", "m2_analyzer.py"),
-                          video_path, outdir],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
-        return outdir
     except Exception:
         return None
+    launched = _launch_analyzer(video_path, outdir, str(video_message_id),
+                                subprocess.DEVNULL, subprocess.DEVNULL)
+    if launched.get("status"):
+        return None
+    return {"outdir": outdir, "run_id": launched["run_id"]}
+
+
+def _read_analyzer_state(outdir, expected_run_id):
+    """Terminal state of an analyzer run, or None when not terminal.
+
+    Returns "ready" (completed/partial evidence for the expected run),
+    "failed" (failed/interrupted for the expected run), or None (still
+    running, terminal for a different run, unreadable, or a legacy run
+    with no state.json). Legacy runs return None so callers keep the
+    old evidence-existence behavior."""
+    try:
+        with open(os.path.join(outdir, "state.json"), encoding="utf-8") as f:
+            st = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(st, dict):
+        return None
+    if expected_run_id and st.get("run_id") and st.get("run_id") != expected_run_id:
+        return None
+    if st.get("state") in ("completed", "partial"):
+        return "ready"
+    if st.get("state") in ("failed", "interrupted"):
+        return "failed"
+    return None
 
 
 def move_videos_to_local_vault(message_id, saved_videos):
@@ -2779,6 +2990,9 @@ def mark_local_deleted(video_message_id, reason):
     if mid in idx:
         idx[mid]["status"] = "deleted"
         save_ttl_index(idx)
+    # Item 1: tombstone first (above), then stop the analyzer tree so
+    # it cannot write back into the deleted vault dir, then delete.
+    _kill_analyzer_runs(video_key=mid)
     return delete_local_video_files(mid)
 
 
@@ -2847,6 +3061,7 @@ def sweep_local_ttl(now=None):
         save_ttl_index(idx)
     for mid in list(tombs.keys()):
         if os.path.isdir(os.path.join(LOCAL_VAULT_DIR, mid)):
+            _kill_analyzer_runs(video_key=mid)
             delete_local_video_files(mid)
     # R2 P0: no tombstone purge (see docstring step 4).
     return expired
@@ -3027,13 +3242,7 @@ def queue_video_analysis(message_id, saved_videos):
     guarantee of evidence-before-reply."""
     analyses = []
     analyzer = os.path.join(ROOT, "analyzer", "m2_analyzer.py")
-    # R2 P0 F2-lite: same override variable as analyzer/m2_analyzer.py.
-    # GPT follow-up 2026-10-31: an empty value counts as unset (an
-    # empty string used literally would silently skip every analysis).
-    venv_py = _resolve_analyzer_py()
-    if not os.path.exists(analyzer) or not os.path.exists(venv_py):
-        if os.environ.get("WECHAT_BRIDGE_ANALYZER_PY"):
-            print(f"video_analysis: analyzer python not found, skipping: {venv_py}", flush=True)
+    if not os.path.exists(analyzer):
         return analyses
     for idx, saved in enumerate(saved_videos or []):
         path = saved.get("path") if isinstance(saved, dict) else None
@@ -3046,17 +3255,28 @@ def queue_video_analysis(message_id, saved_videos):
             os.makedirs(outdir, exist_ok=True)
             log_path = os.path.join(outdir, "analyzer.log")
             logf = open(log_path, "ab")
-            try:
-                subprocess.Popen([venv_py, analyzer, path, outdir],
-                                 stdout=logf, stderr=subprocess.STDOUT,
-                                 stdin=subprocess.DEVNULL,
-                                 start_new_session=True, close_fds=True)
-            finally:
-                logf.close()
-            analyses.append({"video_index": idx, "outdir": outdir, "status": "queued"})
         except Exception as e:
             analyses.append({"video_index": idx, "outdir": outdir, "status": "queue_failed",
                              "error": type(e).__name__})
+            continue
+        try:
+            # Item 1: unified launcher. A missing runtime is a visible
+            # runtime_unavailable entry, never a silent skip.
+            launched = _launch_analyzer(path, outdir, f"{message_id}_{idx}",
+                                        logf, subprocess.STDOUT)
+        finally:
+            logf.close()
+        if launched.get("status") == "runtime_unavailable":
+            analyses.append({"video_index": idx, "outdir": outdir,
+                             "status": "runtime_unavailable",
+                             "reason": launched.get("reason")})
+        elif launched.get("status"):
+            analyses.append({"video_index": idx, "outdir": outdir, "status": "queue_failed",
+                             "error": launched.get("reason")})
+        else:
+            analyses.append({"video_index": idx, "outdir": outdir, "status": "queued",
+                             "run_id": launched["run_id"],
+                             "python": launched["python"]})
     return analyses
 
 
@@ -3640,7 +3860,24 @@ def serve_loop():
                         continue
                     _remain.append(_q)
                     continue
+                # Item 1: a terminal failed/interrupted state is
+                # reported promptly instead of waiting out the 1800 s
+                # timeout; a ready state without evidence (vanished
+                # between publish and delivery) is a failure too.
                 _evp = os.path.join(_q.get("outdir", ""), "evidence.json")
+                _astate = _read_analyzer_state(_q.get("outdir", ""), _q.get("run_id"))
+                if _astate == "failed" or (_astate == "ready" and not os.path.exists(_evp)):
+                    try:
+                        _ok = send_direct_or_outbox(session, "本地分析失败，请重发本地问。", _q.get("to_user_id") or session.get("ilink_user_id"), _q.get("context_token") or "", f"{_q.get('query_mid')}_local_fail.json")
+                    except TokenExpired:
+                        _sender_stop.set()
+                        print("serve: token expired during local fail notice, stopping.", flush=True)
+                        return 14
+                    if _ok:
+                        _pend_changed = True
+                        continue
+                    _remain.append(_q)
+                    continue
                 if os.path.exists(_evp):
                     _summ = build_local_evidence_summary(_evp, _q.get("video_mid"))
                     if _summ:
@@ -3811,12 +4048,12 @@ def serve_loop():
                     if os.path.exists(_evp):
                         _reply = build_local_evidence_summary(_evp, _video_mid) or "本地证据读取失败，请重发本地问。"
                     else:
-                        _outdir = start_local_analysis(_vpath, _video_mid)
-                        if _outdir is None:
+                        _launched = start_local_analysis(_vpath, _video_mid)
+                        if _launched is None:
                             _reply = "本地分析启动失败，请重发本地问。"
                         else:
                             _pend = [q for q in load_pending_local_queries() if q.get("video_mid") != _video_mid]
-                            _pend.append({"query_mid": mid, "video_mid": _video_mid, "outdir": _outdir, "to_user_id": session.get("ilink_user_id"), "context_token": ctx, "started_ts": time.time()})
+                            _pend.append({"query_mid": mid, "video_mid": _video_mid, "outdir": _launched["outdir"], "run_id": _launched["run_id"], "to_user_id": session.get("ilink_user_id"), "context_token": ctx, "started_ts": time.time()})
                             save_pending_local_queries(_pend)
                             _reply = "本地分析正在跑，跑完我把证据摘要发你，不用重发。"
                 try:
