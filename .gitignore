@@ -18,3 +18,7 @@ __pycache__/
 *.download.bin
 # Keep examples only (they are under examples/, not state/)
 !examples/
+
+# v1.1.0: analysis output and local-only vault must never be committed.
+analysis/
+local_vault/
