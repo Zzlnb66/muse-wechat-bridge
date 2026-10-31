@@ -195,3 +195,13 @@
 - 新增测试：tests/test_video_v1.py（视频收发 10 项）、tests/test_quote_v1.py（引用 10 项）；文件发送离线 6 项；视频回归与引用回归在部署前全过。
 - .gitignore 补上 analysis/ 与 local_vault/（此前未覆盖，运行数据与测试数据不得入库）。
 - 验收口径：实测通过即算通过，但每项均按“通过项 + 明确缺口”记录，不把实用实现倒写成正式结项；隐私与权重许可两组证据仍为已知缺口。
+
+## v1.1.1（2026-10-31，R2 P0 修补）
+
+- drain_outbox 附件分派显式化：video → send_video；file → send_file；无 type 或 image → send_image（兼容旧任务格式）；其他未知 type 抛 PermanentError 直接 failed。旧行为是除 video 外一律 send_image，file 附件会发错路。
+- sweep_local_ttl 删除 90 天墓碑清除逻辑与 TOMBSTONE_RETENTION_SECONDS 常量；墓碑只存编号 + 删除时间 + 原因，永久保留。
+- B2-lite：inbox/done 记录删除 context_token 字段；drain_outbox 用 session.get("context_token") 优先、任务字段仅作过渡回落；归档到 sent/failed 前 pop 掉任务的 context_token 再落盘（写失败不阻塞投递）；Worker 模板改读 state/safe_history_view.json，附件 type 必显式。
+- tests/test_video_v1.py：删掉 `or True` 空断言，导入路径改按文件位置相对解析；新增 tests/test_r2_p0.py（14 项：文件分派、未知类型拒绝、旧无类型回归、session token 回落与归档 scrub、墓碑跨 sweep 保留、分析器环境变量覆盖与默认值、记录无 token 源码守卫）。
+- analyzer/m2_analyzer.py 的 VENV_PY 与 stages.py 的 BASE 改环境变量覆盖（WECHAT_BRIDGE_ANALYZER_PY / WECHAT_BRIDGE_ANALYZER_BASE），默认值不变；BASE 对环境变量值补齐末尾斜杠。
+- 未采纳：R2 未知引用禁内联原文。理由：会破坏引用测试 case 5/10（无桥记录老消息的平台内联展示）；本地视频消息本身无正文，且已知本地/墓碑目标本来就剥离内容，永久墓碑又堵住了“删过的编号过期变未知”这条路；resolve_quote docstring 已写明取舍。
+- bridge.py 4333 行，SHA-256 5a1faca1cf2d09a93eee2f22a5b0091b6e29121c3a24ab4f06943590211137b2；部署备份 bridge.py.bak-r2p0-20261031-0925。
