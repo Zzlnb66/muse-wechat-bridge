@@ -159,7 +159,13 @@ def main():
     check("100-day-old tombstone survives sweep",
           "999" in bridge.load_tombstones())
 
-    # 7. Analyzer env overrides; defaults unchanged without env.
+    # 7. Analyzer env contract, item 1 (2026-10-31): stages ALWAYS run
+    # under the analyzer's own sys.executable; the interpreter env var
+    # is honoured by the BRIDGE launcher (validated selection, passed
+    # via the child environment), never re-read by m2_analyzer for
+    # stages. The old VENV_PY variable is gone on purpose: re-reading
+    # a stale invalid value in the child was the FileNotFoundError
+    # chain. BASE override is unchanged.
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env = dict(os.environ)
     env["WECHAT_BRIDGE_ANALYZER_PY"] = "/tmp/custom-venv/bin/python"
@@ -167,14 +173,14 @@ def main():
     code = (
         "import sys; sys.path.insert(0, %r); "
         "import m2_analyzer, stages; "
-        "print(m2_analyzer.VENV_PY); print(stages.BASE)"
+        "print(m2_analyzer.STAGE_PY); print(stages.BASE)"
         % os.path.join(here, "analyzer"))
     out = subprocess.run([sys.executable, "-c", code], env=env,
                          capture_output=True, text=True, timeout=60)
     lines = out.stdout.strip().splitlines()
-    check("analyzer env overrides honoured",
+    check("analyzer stages use own interpreter despite env",
           out.returncode == 0 and len(lines) == 2
-          and lines[0] == "/tmp/custom-venv/bin/python"
+          and lines[0] == sys.executable
           and lines[1] == "/tmp/custom-base/")
     out2 = subprocess.run([sys.executable, "-c", code], capture_output=True,
                           text=True, timeout=60,
@@ -183,7 +189,7 @@ def main():
     lines2 = out2.stdout.strip().splitlines()
     check("analyzer defaults unchanged without env",
           out2.returncode == 0 and len(lines2) == 2
-          and lines2[0].endswith("m0-component/venv/bin/python")
+          and lines2[0] == sys.executable
           and lines2[1].endswith("hidden_files/"))
 
     # 8. Inbox/done record no longer stores context_token. The only

@@ -102,17 +102,30 @@ def test_recipient_match():
 
 
 def test_resolve_analyzer_py():
+    # Item 1 contract: selection is VALIDATED by execution. An unset
+    # or empty env falls through to a real executable; a nonexistent
+    # explicit value is never returned verbatim.
     saved = os.environ.get("WECHAT_BRIDGE_ANALYZER_PY")
     try:
         os.environ.pop("WECHAT_BRIDGE_ANALYZER_PY", None)
-        check("analyzer py: unset env -> default",
-              bridge._resolve_analyzer_py() == bridge.DEFAULT_ANALYZER_PY)
+        got = bridge._resolve_analyzer_py()
+        check("analyzer py: unset env -> real executable",
+              got is not None and os.path.exists(got))
         os.environ["WECHAT_BRIDGE_ANALYZER_PY"] = ""
-        check("analyzer py: empty env -> default (not empty string)",
-              bridge._resolve_analyzer_py() == bridge.DEFAULT_ANALYZER_PY)
-        os.environ["WECHAT_BRIDGE_ANALYZER_PY"] = "/tmp/fake-py"
-        check("analyzer py: set env wins",
-              bridge._resolve_analyzer_py() == "/tmp/fake-py")
+        got = bridge._resolve_analyzer_py()
+        check("analyzer py: empty env -> real executable (not empty)",
+              got is not None and got != "")
+        os.environ["WECHAT_BRIDGE_ANALYZER_PY"] = sys.executable
+        check("analyzer py: valid explicit env wins",
+              bridge._resolve_analyzer_py() == sys.executable)
+        os.environ["WECHAT_BRIDGE_ANALYZER_PY"] = "/nonexistent/py-xyz"
+        got = bridge._resolve_analyzer_py()
+        check("analyzer py: nonexistent explicit never returned",
+              got is not None and got != "/nonexistent/py-xyz"
+              and os.path.exists(got))
+        check("candidate usable: sys.executable yes, missing no",
+              bridge._resolve_candidate(sys.executable) is not None
+              and bridge._resolve_candidate("/nonexistent/py-xyz") is None)
     finally:
         if saved is None:
             os.environ.pop("WECHAT_BRIDGE_ANALYZER_PY", None)
@@ -121,29 +134,48 @@ def test_resolve_analyzer_py():
 
 
 def test_start_local_analysis_paths():
+    # Item 1: unified launcher. Popen is still mocked here for argv
+    # inspection, but the mock returns a live pid so the run registry
+    # path is exercised; the REAL parent-child execution is covered by
+    # test_analyzer_recovery.py, not by this mock.
+    import types
     tmp = tempfile.mkdtemp(prefix="gpt-local-analysis-")
     old_vault = bridge.LOCAL_VAULT_DIR
+    old_runs = bridge.ANALYZER_RUNS_FILE
     bridge.LOCAL_VAULT_DIR = tmp
+    bridge.ANALYZER_RUNS_FILE = os.path.join(tmp, "runs.json")
     orig_popen = bridge.subprocess.Popen
     seen = []
-    bridge.subprocess.Popen = lambda argv, **k: seen.append(argv)
+
+    def fake_popen(argv, **k):
+        # Capture ONLY the analyzer launch; validation runs (python -c)
+        # must still use the real Popen, or the resolver itself breaks.
+        if len(argv) >= 2 and str(argv[1]).endswith("m2_analyzer.py"):
+            seen.append((argv, k))
+            return types.SimpleNamespace(pid=os.getpid())
+        return orig_popen(argv, **k)
+
+    bridge.subprocess.Popen = fake_popen
     saved = os.environ.get("WECHAT_BRIDGE_ANALYZER_PY")
     try:
         os.environ["WECHAT_BRIDGE_ANALYZER_PY"] = "/nonexistent/py-xyz"
         out = bridge.start_local_analysis("/tmp/fake.mp4", "mid1")
-        check("local analysis: missing env path falls back to sys.executable",
-              out is not None and seen and seen[0][0] == sys.executable)
-        real_py = os.path.join(tmp, "fake-py")
-        with open(real_py, "w", encoding="utf-8") as f:
-            f.write("")
-        os.environ["WECHAT_BRIDGE_ANALYZER_PY"] = real_py
+        argv, kwargs = seen[0]
+        check("local analysis: missing env path falls back to a real interpreter",
+              out is not None and out.get("run_id") and argv[0] != "/nonexistent/py-xyz"
+              and os.path.exists(argv[0]) and "--run-id" in argv
+              and kwargs.get("env", {}).get("WECHAT_BRIDGE_ANALYZER_PY") == argv[0])
         seen.clear()
+        os.environ["WECHAT_BRIDGE_ANALYZER_PY"] = sys.executable
         out = bridge.start_local_analysis("/tmp/fake.mp4", "mid2")
-        check("local analysis: existing env path is honored",
-              out is not None and seen and seen[0][0] == real_py)
+        argv, kwargs = seen[0]
+        check("local analysis: valid env path is honored with run-id and env",
+              out is not None and argv[0] == sys.executable and "--run-id" in argv
+              and kwargs.get("env", {}).get("WECHAT_BRIDGE_ANALYZER_PY") == sys.executable)
     finally:
         bridge.subprocess.Popen = orig_popen
         bridge.LOCAL_VAULT_DIR = old_vault
+        bridge.ANALYZER_RUNS_FILE = old_runs
         if saved is None:
             os.environ.pop("WECHAT_BRIDGE_ANALYZER_PY", None)
         else:
