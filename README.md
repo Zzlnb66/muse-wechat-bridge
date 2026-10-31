@@ -230,3 +230,26 @@ python3 bridge.py serve
 ## 部署版与发布提交的对应关系
 
 运行版 bridge.py SHA-256：0baae4777da7dda14591c7b89636bc4bf2b8026a7beece1e1f2932c7334eb952；分析器 m2_analyzer.py SHA-256：f1216e9b13a3e33ce36350eaa7f39fff1de0b49f6269f9fc8d1e9ca269537e66；stages.py SHA-256：53c0ebc81966e52b3bbeab31cecba196c2226be2ef535c4ff89b547d5556b390。部署：2026-10-31，serve PID 125103，微信实测消息 7522129217093041288；发布提交即本 Release 的 Tag 提交。
+
+# v1.1.3（第 1 项：分析器恢复，2026-10-31，已部署并微信实测）
+
+本节为第 1 项的发布说明。基线 v1.1.2；改动只针对分析器启动与失败处理，不改视频收发与文件逻辑。
+
+## 改了什么
+
+- **解释器选型改执行验证**：不再只返回配置字符串。顺序为显式配置 → 默认 venv → 桥自身解释器，逐个验证可执行，无可用时记为 runtime_unavailable，不再静默跳过分析。
+- **统一启动器**：按 outdir 去重，子进程 env 写入选中解释器，传 --run-id，start_new_session；运行登记写 state/analyzer_runs.json（含僵尸进程判定）。
+- **分析器**：VENV_PY 删除，阶段一律用自身 sys.executable；run_stage 启动前删旧输出，校验退出码 + JSON 对象 + _status + _run_id 回显，异常转结构化失败类别；音频提取异常只记该轨 failed，不掀翻整个分析；evidence/narrative 原子写；终态写 state.json（m2-run-state-0.1）：无 completed → failed，有 failed/skipped → partial，全成才 completed。
+- **本地追问投递读终态**：failed/interrupted 立即失败通知，不再等 1800 秒；ready 但 evidence 消失也算失败。
+- **删除防复活**：立碑后按身份核查停掉对应分析进程树（TERM → 0.5 秒 → KILL），身份不符绝不误杀。
+- **两处有意偏离方案原文**：outdir 布局不动（不用 runs/<run_id>/ 子目录，隔离靠清旧文件 + run_id 回显）；VENV_PY 删除导致旧测试按新契约改写。
+
+## 测试
+
+- 新增 tests/test_analyzer_recovery.py，23/23（含真实父子进程链，非 mock）；旧全套回归全绿；test_gpt_followup.py 与 test_r2_p0.py 按新契约更新（前者 22/22）。
+- bridge.py 4654 行，SHA-256 40fc4b6daf99c2700bbf3c94dc480651539102ad693f2886e0d870c29b63fcec；分析器 m2_analyzer.py SHA-256 4bf9f80d6c4844d00d51c15b29fac708f8eef63a47f9c1d9ef407ba8c872b9a3，stages.py SHA-256 d07030e8207bf3aed4eb218272612ee6667fb52de34720bc81bfa787bdb084cb。
+
+## 微信实测与未验证项
+
+- 实测视频 7522151925994483720（5.0 秒）：分析终态 partial，completed=[probe, frames]，skipped=[ocr, asr, sound]，原因是内存门控（MemAvailable 约 352 MiB 落等待区，经 3 次复查后 REJECT），属老门控行为，不是新代码问题；Worker 排队回复已发出且归档无 token。
+- **未验证**：OCR/ASR/声音三轨在新代码下的真实全轨实跑（两次均被内存门控跳过）；真实分析进程的删除停树只在 sleep 进程上验证过机制。

@@ -247,3 +247,13 @@
 - 生产 Worker 指令的 token 处理部分：v1.1.1 部署后尚无 Worker 经手的新回复可供行为验证（部署后唯一的 sent 任务是测试任务），下一次真实 Worker 回复后查其 sent 任务是否含 token 字段才能定论。
 - 收件人错配检查无单用户微信实测，以离线测试为准。
 - 文件入站（type 4 接收）仍未做；R2 其余大架构仍推迟；v1.1.2 Tag 未打。
+
+# v1.1.3（第 1 项：分析器恢复，2026-10-31）
+
+- `_resolve_analyzer_runtime()`：返回 (path, reason)，无可用返回 runtime_unavailable；旧 `_resolve_analyzer_py()` 只返回配置字符串的问题已修。
+- `_launch_analyzer`：outdir 去重、env 写入选中解释器、--run-id、start_new_session、state/analyzer_runs.json 登记。
+- 分析器：删 VENV_PY，阶段用 sys.executable；run_stage 校验退出码 + JSON 对象 + _status + _run_id 回显；音频提取异常转 failed track；evidence/narrative 原子写；state.json 终态规则见 README。
+- 本地追问：投递读终态，failed/interrupted 立即通知；删除立碑后按身份停进程树。
+- 测试：tests/test_analyzer_recovery.py 23/23；test_gpt_followup.py 更新至 22/22；test_r2_p0.py 按新契约更新；旧全套全绿。
+- bridge.py 4654 行，SHA-256 40fc4b6daf99c2700bbf3c94dc480651539102ad693f2886e0d870c29b63fcec；部署备份 bridge.py.bak-item1-20261031-1151；部署后 serve PID 19440，verify-channel recovered=true。
+- 未验证：新代码下 OCR/ASR/声音全轨实跑；真实分析进程删除停树机制只在 sleep 进程上验证。
