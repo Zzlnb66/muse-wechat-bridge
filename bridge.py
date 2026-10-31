@@ -62,6 +62,9 @@ contain it.
 
 import argparse
 import base64
+import hashlib
+import re
+import unicodedata
 try:
     import fcntl
 except ImportError:
@@ -163,6 +166,22 @@ def _is_terminal_job(job):
         return True
     if job.get('delivery_state') == 'unknown_restart':
         return True
+    # Item 3 (2026-10-31): a long-text plan job is terminal only when
+    # every text part AND every attachment is in a terminal state
+    # (sent/failed/needs_check/blocked_by_prior) and at least one
+    # part/attachment is failed/needs_check. 'blocked_by_prior' alone
+    # is a stop, not a failure: it only becomes terminal together
+    # with the failed/needs_check part that blocked it. A part still
+    # 'pending' or 'sending' keeps the job non-terminal, so drain
+    # retries it instead of archiving it away.
+    _plan = job.get('text_parts') if job.get('text_plan_version') == 1 and isinstance(job.get('text_parts'), list) else None
+    if _plan is not None and job.get('text'):
+        _part_term = all(isinstance(p, dict) and p.get('status') in ('sent', 'failed', 'needs_check', 'blocked_by_prior') for p in _plan)
+        _atts = _terminal_attachments(job)
+        _att_term = all(isinstance(a, dict) and a.get('status') in ('sent', 'failed', 'needs_check', 'blocked_by_prior') for a in _atts)
+        _has_bad = any(isinstance(p, dict) and p.get('status') in ('failed', 'needs_check') for p in _plan) or any(
+            isinstance(a, dict) and a.get('status') in ('failed', 'needs_check') for a in _atts)
+        return bool(_part_term and _att_term and _has_bad)
     text = job.get('text')
     atts = _terminal_attachments(job)
     if not text and not atts:
@@ -3477,16 +3496,62 @@ def build_safe_history_view(max_rounds=SAFE_VIEW_MAX_ROUNDS):
             elif rec.get("files"):
                 user_text = "附文件 %d 个" % len(rec["files"])
         answer_text = None
+        answer_extra = {}
         try:
             sent = json.load(open(os.path.join(OUTBOX_SENT, "%s.json" % mid), encoding="utf-8"))
             if isinstance(sent, dict):
                 answer_text = sent.get("text")
+                # Item 3: an all-sent plan job really did deliver the
+                # full text (in labelled parts); say so explicitly
+                # so the Worker does not have to guess.
+                if _text_plan(sent) is not None:
+                    answer_extra = {
+                        "delivery_status": "all_parts_sent",
+                        "text_parts": "%d/%d sent" % (
+                            sum(1 for p in sent["text_parts"] if p.get("status") == "sent"),
+                            len(sent["text_parts"])),
+                    }
         except Exception:
             answer_text = None
+        if answer_text is None:
+            # Item 3 partial delivery: a plan job in failed/ or
+            # pending/ with some parts sent and some failed /
+            # needs_check / blocked must NEVER be shown as if the
+            # user had read the full answer. Show only the delivery
+            # status and the part numbers to check, never the full
+            # top-level text (which the user has not fully received).
+            for _dir in (OUTBOX_FAILED, OUTBOX_PENDING):
+                try:
+                    _pj = json.load(open(os.path.join(_dir, "%s.json" % mid), encoding="utf-8"))
+                except Exception:
+                    continue
+                _plan = _text_plan(_pj) if isinstance(_pj, dict) else None
+                if _plan is None:
+                    continue
+                _sent_n = [p["index"] + 1 for p in _plan if p.get("status") == "sent"]
+                _bad_n = [p["index"] + 1 for p in _plan if p.get("status") in ("failed", "needs_check")]
+                _blocked_n = [p["index"] + 1 for p in _plan if p.get("status") == "blocked_by_prior"]
+                if _sent_n or _bad_n:
+                    answer_text = ("【长文部分送达：第 %s 段已送达，第 %s 段待核对，第 %s 段未发送；"
+                                   "请勿视为用户已读完整答案】" % (
+                                       "/".join(str(n) for n in _sent_n) if _sent_n else "无",
+                                       "/".join(str(n) for n in _bad_n) if _bad_n else "无",
+                                       "/".join(str(n) for n in _blocked_n) if _blocked_n else "无"))
+                    answer_extra = {
+                        "delivery_status": "partial",
+                        "text_parts_sent": _sent_n,
+                        "text_parts_needs_check": _bad_n,
+                        "text_parts_blocked": _blocked_n,
+                    }
+                break
+        _answer = None
+        if answer_text:
+            _answer = {"history_class": "formal_answer", "text": answer_text}
+            _answer.update(answer_extra)
         rounds.append({
             "message_id": mid,
             "user": {"history_class": "user", "text": user_text},
-            "answer": ({"history_class": "formal_answer", "text": answer_text} if answer_text else None),
+            "answer": _answer,
         })
     rounds = rounds[-int(max_rounds):] if max_rounds else rounds
     queue_count = status_count = 0
@@ -3611,6 +3676,281 @@ def queue_video_analysis(message_id, saved_videos):
     return analyses
 
 
+# ------------------------------------------------------------------
+# Item 3 (2026-10-31): long-text segmentation.
+#
+# A long answer is NEVER sliced inside send_text(). Instead drain_outbox
+# builds a plan first, persists it in the SAME outbox job file, and
+# then sends only the plan's display_text parts, in order:
+#   text_plan_version = 1
+#   text_parts[] = {index, raw_slice, display_text, sha256, client_id,
+#                   status, attempts, error_code}
+#   full_text_sha256 = sha256 of the whole top-level text
+# The top-level 'text' field keeps the full text for history reading,
+# but the new sender never sends it directly once a plan exists.
+#   display budget = 1800 characters, counting the part label
+#   "[i/N]" AND any fence close/reopen lines added for that part.
+#   max parts = 20; more than that is rejected BEFORE any send, with
+#   a prompt to deliver as a file instead (see drain_outbox).
+# Ordering / failure rules (the whole point of the plan):
+#   - a part is persisted as 'sending' before its network call, and
+#     as 'sent' immediately after success. A post-send persist failure
+#     HALTs the job in this process (see drain_outbox); on restart,
+#     recover_sending_on_startup turns a residual 'sending' part into
+#     'needs_check' (see there).
+#   - an unknown or failed part stops everything behind it: later
+#     parts and all attachments become 'blocked_by_prior' and the job
+#     goes to failed/ for manual check. Sent parts are never resent.
+#   - a retryable part keeps the job in pending/ (up to 3 attempts);
+#     later parts and attachments wait until it succeeds.
+#   - attachments are sent only after EVERY text part is sent.
+# Manual resend (no reslicing, sent parts untouched):
+#   python3 bridge.py resend-text-part <job-file> <1-based part number>
+#   It only resets that one part to 'pending' (and clears the job's
+#   terminal flag) and moves the job back to pending/. Parts that
+#   were 'blocked_by_prior' stay blocked until every part before
+#   them is sent; drain_outbox then resumes them in order. That is
+#   the only way a blocked tail restarts: the operator never has to
+#   (and must not) rewrite the other parts. The command also sets
+#   manual_resend_part, which drain_outbox uses to drop the job
+#   from the long-running serve's in-memory terminal set -- without
+#   that, the serve that archived the job would re-archive the
+#   resend without sending it.
+# Rollback warning: an OLD sender (before this item) does not know
+# text_parts and will send the top-level full text once. Before any
+# rollback, isolate every new-format pending/failed job first; never
+# let an old serve drain them.
+# ------------------------------------------------------------------
+TEXT_DISPLAY_BUDGET = 1800
+TEXT_PLAN_VERSION = 1
+TEXT_PLAN_MAX_PARTS = 20
+# Max label length for N <= 20: "[20/20]\n" is 8 chars. Budgeting
+# with this maximum (instead of the actual "[i/N]") guarantees every
+# display_text fits the budget without iterating to a stable N.
+_TEXT_MAX_LABEL_LEN = len("[20/20]\n")
+
+
+class LongTextTooManyParts(Exception):
+    """Segmentation would need more than TEXT_PLAN_MAX_PARTS parts."""
+
+
+def _split_keepends_nl(text):
+    """Split on '\\n' only, keeping each line break. Joining the
+    result reproduces the input exactly (unlike splitlines, which
+    also splits on \\v/\\f/\\x85/\\u2028 etc.)."""
+    lines = []
+    start = 0
+    while start < len(text):
+        idx = text.find("\n", start)
+        if idx == -1:
+            lines.append(text[start:])
+            break
+        lines.append(text[start:idx + 1])
+        start = idx + 1
+    return lines
+
+
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*(.*?)[ \t]*\r?$")
+
+
+def _fence_match(line):
+    """Return (char, run_len, info) for a fence delimiter line, else
+    None. The trailing newline is stripped before matching; a line
+    is only a delimiter if it is made of backticks or tildes."""
+    stripped = line.rstrip("\r\n")
+    m = _FENCE_RE.match(stripped)
+    if not m:
+        return None
+    run = m.group(1)
+    return (run[0], len(run), m.group(2).strip())
+
+
+def _update_fence(fence, line):
+    """Advance fence state (None or (char, run_len, info)) past one
+    whole line. A closing fence must use the same character, a run
+    at least as long as the opening run, and no info string."""
+    fm = _fence_match(line)
+    if fm is None:
+        return fence
+    char, run_len, info = fm
+    if fence is None:
+        return (char, run_len, info)
+    if char == fence[0] and run_len >= fence[1] and info == "":
+        return None
+    return fence
+
+
+def _fence_line(fence):
+    char, run_len, info = fence
+    return char * run_len + (info if info else "") + "\n"
+
+
+def _safe_char_cut(text, max_len):
+    """Cut text to at most max_len characters without splitting a
+    grapheme cluster: never leave a combining mark, variation
+    selector, or ZWJ sequence's tail at the start of the next chunk.
+    Falls back to the raw cut if backing off would make no progress
+    (e.g. a run of combining marks), so callers always progress."""
+    if len(text) <= max_len:
+        return text
+    cut = max_len
+    while cut > 0 and (unicodedata.combining(text[cut]) != 0
+                       or text[cut] in ("\u200d", "\ufe0e", "\ufe0f")):
+        cut -= 1
+    while cut > 0 and text[cut - 1] == "\u200d":
+        cut -= 1
+    if cut <= 0:
+        return text[:max_len]
+    return text[:cut]
+
+
+def _segment_raw_slices(text):
+    """Greedy line segmentation into raw slices (no labels yet).
+
+    Cut preference, in order: paragraph boundary, then line
+    boundary, then a Unicode-safe character cut. A paragraph
+    boundary is a blank line; it is only preferred when cutting
+    there still keeps at least 60% of the part's content budget
+    (an implementation choice: the scheme names the preference
+    order but no threshold, and cutting at a very early blank
+    line would produce tiny parts). Overlong single lines are
+    character-cut. Returns [(raw_slice, fence_at_start, fence_at_end)].
+    Fence state is tracked line by line, so a part that starts or
+    ends inside a fenced block knows it for display construction."""
+    lines = _split_keepends_nl(text)
+    slices = []
+    fence = None
+    i = 0
+    while i < len(lines):
+        part_start_fence = fence
+        part_lines = []
+        part_fence_states = []
+        # Accumulate whole lines while the display fits.
+        while i < len(lines):
+            line = lines[i]
+            new_fence = _update_fence(fence, line)
+            reopen_len = len(_fence_line(part_start_fence)) if part_start_fence else 0
+            tentative_raw = "".join(part_lines) + line
+            close_len = 0
+            if new_fence is not None:
+                # Closing fence: run + newline only, no info string.
+                close_len = new_fence[1] + 1
+                if not tentative_raw.endswith("\n"):
+                    close_len += 1
+            display_len = _TEXT_MAX_LABEL_LEN + reopen_len + len(tentative_raw) + close_len
+            if display_len > TEXT_DISPLAY_BUDGET and part_lines:
+                break
+            if display_len > TEXT_DISPLAY_BUDGET and not part_lines:
+                # Single overlong line: character-cut it below, do
+                # not consume it as a whole line.
+                break
+            part_lines.append(line)
+            part_fence_states.append(new_fence)
+            fence = new_fence
+            i += 1
+        if not part_lines:
+            # Overlong single line (and not a fence delimiter line,
+            # which is short by construction): character-cut a chunk.
+            line = lines[i]
+            reopen_len = len(_fence_line(part_start_fence)) if part_start_fence else 0
+            close_len = 0
+            if fence is not None:
+                # Closing fence (run + newline) plus the newline
+                # inserted before it, since a mid-line chunk never
+                # ends with one.
+                close_len = fence[1] + 2
+            capacity = TEXT_DISPLAY_BUDGET - _TEXT_MAX_LABEL_LEN - reopen_len - close_len
+            if capacity <= 0:
+                capacity = 1
+            chunk = _safe_char_cut(line, capacity)
+            if not chunk:
+                chunk = line[:1]
+            lines[i] = line[len(chunk):]
+            slices.append((chunk, part_start_fence, fence))
+            continue
+        # Paragraph preference: cut back to the last blank line in
+        # the part, if that still keeps >= 60% of the content budget
+        # and leaves lines for the next part.
+        content_budget = TEXT_DISPLAY_BUDGET - _TEXT_MAX_LABEL_LEN
+        kept = 0
+        cut_at = None
+        for j, ln in enumerate(part_lines):
+            kept += len(ln)
+            if ln.strip() == "" and j < len(part_lines) - 1:
+                if kept >= 0.6 * content_budget:
+                    cut_at = j
+        if cut_at is not None:
+            back = len(part_lines) - cut_at - 1
+            i -= back
+            fence = part_fence_states[cut_at]
+            part_lines = part_lines[:cut_at + 1]
+        slices.append(("".join(part_lines), part_start_fence, fence))
+    return slices
+
+
+def _segment_text(text):
+    """Build a long-text plan. Returns (parts, full_text_sha256).
+    Raises LongTextTooManyParts if more than 20 parts are needed.
+    Every display_text is verified to fit TEXT_DISPLAY_BUDGET and
+    every raw_slice concatenation is verified to restore the text."""
+    raw_slices = _segment_raw_slices(text)
+    if len(raw_slices) > TEXT_PLAN_MAX_PARTS:
+        raise LongTextTooManyParts(
+            "%d parts would exceed the %d-part maximum" % (len(raw_slices), TEXT_PLAN_MAX_PARTS))
+    total = len(raw_slices)
+    parts = []
+    for idx, (raw, fence_start, fence_end) in enumerate(raw_slices):
+        label = "[%d/%d]\n" % (idx + 1, total)
+        reopen = _fence_line(fence_start) if fence_start else ""
+        close = ""
+        if fence_end is not None:
+            # A closing fence carries NO info string (unlike the
+            # reopen line above, which repeats the opening fence
+            # including its info string, e.g. ```python).
+            close = ("\n" if not raw.endswith("\n") else "") + fence_end[0] * fence_end[1] + "\n"
+        display = label + reopen + raw + close
+        if len(display) > TEXT_DISPLAY_BUDGET:
+            raise ValueError("segment display exceeds budget for part %d" % (idx + 1))
+        parts.append({
+            "index": idx,
+            "raw_slice": raw,
+            "display_text": display,
+            "sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            "client_id": uuid.uuid4().hex,
+            "status": "pending",
+            "attempts": 0,
+            "error_code": None,
+        })
+    if "".join(p["raw_slice"] for p in parts) != text:
+        raise ValueError("segment raw slices do not restore the full text")
+    return parts, hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _text_plan(job):
+    if job.get("text_plan_version") != TEXT_PLAN_VERSION:
+        return None
+    parts = job.get("text_parts")
+    if not isinstance(parts, list) or not parts:
+        return None
+    return parts
+
+
+def _plan_never_attempted(job):
+    """True only if no text/attachment item has ever been attempted:
+    the only case where an old long text may be upgraded to a plan
+    in drain. Anything already sent/failed/needs_check, or with an
+    attempt count, keeps the legacy single-send path."""
+    if job.get("text_status") in ("sent", "failed", "needs_check"):
+        return False
+    if int(job.get("text_attempts") or 0) > 0:
+        return False
+    for att in _terminal_attachments(job):
+        if isinstance(att, dict) and (att.get("status") in ("sent", "failed", "needs_check")
+                                      or int(att.get("attempts") or 0) > 0):
+            return False
+    return True
+
+
 def send_text(session, text, to_user_id=None, context_token=None, client_id=None):
     """Send one text message. Returns the parsed response on success.
     Audit 3: post failure during final sendmessage = UnknownDeliveryError
@@ -3673,15 +4013,39 @@ def recover_sending_on_startup():
                 job = json.load(f)
         except Exception:
             continue
-        if job.get("delivery_state") == "sending":
+        _plan_rec = _text_plan(job)
+        _plan_sending = bool(_plan_rec and any(
+            isinstance(p, dict) and p.get("status") == "sending" for p in _plan_rec))
+        if job.get("delivery_state") == "sending" or _plan_sending:
+            if _plan_sending:
+                # Item 3: a residual 'sending' text part is
+                # result-unknown, so it goes to needs_check (never
+                # auto-resent), later pending parts and pending
+                # attachments are blocked_by_prior, and the whole job
+                # goes to failed/ for manual check. The operator
+                # resends only that part via resend-text-part.
+                for _p in _plan_rec:
+                    if _p.get("status") == "sending":
+                        _p["status"] = "needs_check"
+                        _p["error_code"] = "restart_unknown"
+                    elif _p.get("status") == "pending":
+                        _p["status"] = "blocked_by_prior"
+                for _att in job.get("attachments") or []:
+                    if isinstance(_att, dict) and _att.get("status") not in ("sent", "failed", "needs_check"):
+                        _att["status"] = "blocked_by_prior"
+                job["text_status"] = "needs_check"
+                job["needs_check_reason"] = "serve restarted with text part in sending state"
+            else:
+                job["needs_check_reason"] = "serve restarted with item in sending state"
             job["delivery_state"] = "unknown_restart"
             # v1.0.2: persist the terminal marker on disk BEFORE the
             # move attempt, so a move failure + process restart still
             # leaves a disk-recognisable terminal job (not just a
             # memory set entry). Its text/attachment statuses stay
             # 'pending' on purpose: the delivery result is unknown.
+            # (Item 3 plan jobs are the exception above: their
+            # sending part is normalised to needs_check first.)
             job["terminal"] = True
-            job["needs_check_reason"] = "serve restarted with item in sending state"
             try:
                 atomic_write_json(path, job, mode=0o600)
                 os.replace(path, os.path.join(OUTBOX_FAILED, name))
@@ -3780,6 +4144,15 @@ def drain_outbox(session):
         # never be sent again, even if its earlier move to failed/
         # failed and it is still sitting in pending/. A terminal job
         # may only retry archiving, never re-enter sending.
+        # Item 3 exception: a job the operator explicitly put back
+        # via resend-text-part (manual_resend_part set, terminal
+        # flag cleared on disk) is NOT terminal, even though this
+        # long-running serve process still has its name in the
+        # in-memory terminal set from when it archived the job.
+        # Without this discard, a manual resend would be re-archived
+        # without sending by the very serve that archived it.
+        if job.get("manual_resend_part") is not None and not job.get("terminal"):
+            _TERMINAL_TASK_IDS.discard(name)
         if name in _TERMINAL_TASK_IDS or _is_terminal_job(job):
             _TERMINAL_TASK_IDS.add(name)
             failed_names.append(name)
@@ -3840,10 +4213,193 @@ def drain_outbox(session):
         for att in attachments:
             if isinstance(att, dict) and not att.get("client_id"):
                 att["client_id"] = uuid.uuid4().hex
+        # Item 3 long-text plan handling. Short texts and old jobs
+        # that were already attempted keep the legacy single-send
+        # path below (_plan is None). A plan job sends ONLY its
+        # display_text parts, in order, never the top-level text.
+        _plan = None
+        _plan_blocked = False
+        _plan_halted = False
+        if text:
+            _existing_plan = _text_plan(job)
+            if _existing_plan is not None:
+                _plan = _existing_plan
+                if job.get("full_text_sha256") != hashlib.sha256(text.encode("utf-8")).hexdigest():
+                    if any(isinstance(p, dict) and p.get("status") in ("sent", "failed", "needs_check") for p in _plan):
+                        # Stale plan with sent parts: never reslice.
+                        job["delivery_state"] = "needs_check"
+                        job["needs_check_reason"] = "text_plan_mismatch"
+                        job["terminal"] = True
+                        _plan_blocked = True
+                        changed = True
+                    else:
+                        try:
+                            _parts, _sha = _segment_text(text)
+                        except LongTextTooManyParts as _e:
+                            job["text_status"] = "failed"
+                            job["text_error"] = "text too long: %s, deliver as file instead" % _e
+                            job["terminal"] = True
+                            _plan_blocked = True
+                            changed = True
+                        except Exception as _e:
+                            _SEND_COOLDOWN[name] = time.time()
+                            print(f"outbox: plan rebuild failed, skipping send (cooldown 10s): {_sanitize_error(_e)}", flush=True)
+                            continue
+                        else:
+                            job["text_plan_version"] = TEXT_PLAN_VERSION
+                            job["text_parts"] = _parts
+                            job["full_text_sha256"] = _sha
+                            _plan = _parts
+                            try:
+                                atomic_write_json(path, job, mode=0o600)
+                            except Exception as _e:
+                                _SEND_COOLDOWN[name] = time.time()
+                                print(f"outbox: plan write failed, zero sends (cooldown 10s): {_sanitize_error(_e)}", flush=True)
+                                continue
+            elif len(text) > TEXT_DISPLAY_BUDGET and _plan_never_attempted(job):
+                try:
+                    _parts, _sha = _segment_text(text)
+                except LongTextTooManyParts as _e:
+                    job["text_status"] = "failed"
+                    job["text_error"] = "text too long: %s, deliver as file instead" % _e
+                    job["terminal"] = True
+                    _plan_blocked = True
+                    changed = True
+                except Exception as _e:
+                    _SEND_COOLDOWN[name] = time.time()
+                    print(f"outbox: plan build failed, zero sends (cooldown 10s): {_sanitize_error(_e)}", flush=True)
+                    continue
+                else:
+                    job["text_plan_version"] = TEXT_PLAN_VERSION
+                    job["text_parts"] = _parts
+                    job["full_text_sha256"] = _sha
+                    _plan = _parts
+                    try:
+                        atomic_write_json(path, job, mode=0o600)
+                    except Exception as _e:
+                        _SEND_COOLDOWN[name] = time.time()
+                        print(f"outbox: plan write failed, zero sends (cooldown 10s): {_sanitize_error(_e)}", flush=True)
+                        continue
+        if _plan is not None and not _plan_blocked:
+            _part_bad = False
+            _part_retry = False
+            for _part in _plan:
+                if not isinstance(_part, dict):
+                    continue
+                _pstatus = _part.get("status")
+                if _pstatus == "blocked_by_prior":
+                    # Tail resumes only once every earlier part is
+                    # sent; otherwise it stays blocked.
+                    if all(isinstance(p, dict) and p.get("status") == "sent" for p in _plan[:_part.get("index", 0)]):
+                        _part["status"] = "pending"
+                        _pstatus = "pending"
+                        changed = True
+                    else:
+                        continue
+                if _pstatus == "sent":
+                    continue
+                if _pstatus in ("failed", "needs_check"):
+                    _part_bad = True
+                    continue
+                if _pstatus == "sending":
+                    # Result unknown at drain start (e.g. a halted
+                    # job re-entering drain): never auto-resend it.
+                    _part["status"] = "needs_check"
+                    _part["error_code"] = "restart_unknown"
+                    _part_bad = True
+                    changed = True
+                    continue
+                # Pending part: persist 'sending' BEFORE the call.
+                _part["status"] = "sending"
+                job["delivery_state"] = "sending"
+                changed = True
+                try:
+                    atomic_write_json(path, job, mode=0o600)
+                except Exception as _e:
+                    _part["status"] = "pending"
+                    job["delivery_state"] = "pending"
+                    _SEND_COOLDOWN[name] = time.time()
+                    print(f"outbox: part sending-state write failed, skipping send (cooldown 10s): {_sanitize_error(_e)}", flush=True)
+                    _part_retry = True
+                    break
+                try:
+                    _part["attempts"] = int(_part.get("attempts", 0)) + 1
+                    send_text(session, _part["display_text"], to_user_id=job.get("to_user_id"),
+                              context_token=_job_token,
+                              client_id=_part.get("client_id"))
+                except TokenExpired:
+                    raise
+                except Exception as _e:
+                    _status, _unk = _classify_delivery_error(_e)
+                    if _status == "pending":
+                        if _part["attempts"] >= 3:
+                            _part["status"] = "failed"
+                            _part["error_code"] = "retry_limit"
+                            _part_bad = True
+                        else:
+                            _part["status"] = "pending"
+                            _part["error_code"] = "retryable"
+                            _part_retry = True
+                    else:
+                        _part["status"] = _status
+                        _part["error_code"] = "permanent" if _status == "failed" else "unknown_delivery"
+                        _part_bad = True
+                    job["delivery_state"] = _part["status"]
+                    changed = True
+                    print(f"outbox: text part {_part.get('index')} {_part['status']} for {name}: {_sanitize_error(_e)}", flush=True)
+                    try:
+                        atomic_write_json(path, job, mode=0o600)
+                        changed = False
+                    except Exception as _we:
+                        _IN_MEMORY_HALTED_FILES.add(name)
+                        print(f"outbox: HALTED {name} after part state write failure, will not auto-resend", flush=True)
+                        _plan_halted = True
+                    break
+                else:
+                    _part["status"] = "sent"
+                    _part["error_code"] = None
+                    job["delivery_state"] = "pending"
+                    changed = True
+                    try:
+                        atomic_write_json(path, job, mode=0o600)
+                        changed = False
+                    except Exception as _we:
+                        _IN_MEMORY_HALTED_FILES.add(name)
+                        print(f"outbox: HALTED {name} after part state write failure, will not auto-resend", flush=True)
+                        _plan_halted = True
+                    if _plan_halted:
+                        break
+                    # Otherwise the loop continues to the next
+                    # part in order; do NOT break on success.
+            if _plan_halted:
+                continue
+            if all(isinstance(p, dict) and p.get("status") == "sent" for p in _plan):
+                job["text_status"] = "sent"
+                changed = True
+            elif _part_bad:
+                for _p in _plan:
+                    if isinstance(_p, dict) and _p.get("status") == "pending":
+                        _p["status"] = "blocked_by_prior"
+                        changed = True
+                for _att in attachments:
+                    if isinstance(_att, dict) and _att.get("status") not in ("sent", "failed", "needs_check"):
+                        _att["status"] = "blocked_by_prior"
+                        changed = True
+                job["text_status"] = "needs_check" if any(
+                    isinstance(p, dict) and p.get("status") == "needs_check" for p in _plan) else "failed"
+                job["delivery_state"] = "needs_check"
+                job["needs_check_reason"] = "text_part_failed_or_unknown"
+                _plan_blocked = True
+            else:
+                # A retryable part (or a pre-send write failure) is
+                # still pending: later parts and attachments wait.
+                _plan_blocked = True
+        if _plan_halted:
+            continue
         # Text item. v1.0.2 sub-item interception: a failed/needs_check
         # text item is terminal on its own, even when other items in
         # the same job are still pending.
-        if text and job.get("text_status") not in ("sent", "failed", "needs_check"):
+        if _plan is None and not _plan_blocked and text and job.get("text_status") not in ("sent", "failed", "needs_check"):
             job["delivery_state"] = "sending"
             _state_ok = True
             try:
@@ -3876,11 +4432,19 @@ def drain_outbox(session):
                 changed = True
                 print(f"outbox: text {status} for {name}: {_sanitize_error(e)}", flush=True)
         # Attachment items, each with its persisted client_id.
+        # Item 3: attachments wait for the whole text (plan or
+        # legacy) to be sent; a blocked plan job sends none here.
         for att in attachments:
+            if _plan_blocked:
+                break
             if not isinstance(att, dict):
                 continue
+            if att.get("status") == "blocked_by_prior" and _plan is not None and all(
+                    isinstance(p, dict) and p.get("status") == "sent" for p in _plan):
+                att["status"] = "pending"
+                changed = True
             # v1.0.2 sub-item interception, same rule as text above.
-            if att.get("status") in ("sent", "failed", "needs_check"):
+            if att.get("status") in ("sent", "failed", "needs_check", "blocked_by_prior"):
                 continue
             att_path = att.get("path") or att.get("image_path")
             job["delivery_state"] = "sending"
@@ -3928,7 +4492,15 @@ def drain_outbox(session):
                 print(f"outbox: {att.get('type') or 'image'} {status} for {name}: {_sanitize_error(e)}", flush=True)
         if attachments:
             job["attachments"] = attachments
-        all_sent = (not text or job.get("text_status") == "sent") and all(
+        # Item 3: for a plan job, text is sent only when every part
+        # is sent; the legacy text_status field is set to 'sent'
+        # by the part loop in that case, but check the parts
+        # directly so a stale text_status cannot fake all_sent.
+        if _plan is not None:
+            _text_sent = all(isinstance(p, dict) and p.get("status") == "sent" for p in _plan)
+        else:
+            _text_sent = (not text or job.get("text_status") == "sent")
+        all_sent = _text_sent and all(
             a.get("status") == "sent" for a in attachments)
         # Fix 2026-10-28: attachment loop sets delivery_state="sending"
         # before each send but never sets it back to "sent" on success,
@@ -5006,6 +5578,81 @@ def cmd_status(_args):
     return 0
 
 
+def cmd_resend_text_part(args):
+    """Item 3 manual resend: reset ONE text part to 'pending'.
+
+    Usage: python3 bridge.py resend-text-part <job-file> <part>
+    <job-file> is a filename in outbox/failed/ (or outbox/pending/,
+    or a full path); <part> is the 1-based part number shown as
+    [i/N] in the sent display text. Only that part is reset:
+    sent parts are never resent, the plan is never resliced, and
+    other parts (including blocked_by_prior ones) are untouched
+    here -- a blocked tail resumes in drain_outbox only once every
+    earlier part is sent. Refuses to run if the job has no plan,
+    the part number is out of range, the part is already sent /
+    pending / sending, or the plan's full_text_sha256 no longer
+    matches the top-level text. Prints only part/job metadata,
+    never tokens or user identifiers."""
+    job_arg = args.job
+    if os.path.sep in job_arg or (os.path.altsep and os.path.altsep in job_arg):
+        candidates = [job_arg]
+    else:
+        candidates = [os.path.join(OUTBOX_FAILED, job_arg),
+                      os.path.join(OUTBOX_PENDING, job_arg)]
+    path = None
+    for cand in candidates:
+        if os.path.exists(cand):
+            path = cand
+            break
+    if path is None:
+        print("resend-text-part: job not found in outbox/failed/ or outbox/pending/", flush=True)
+        return 1
+    try:
+        with open(path, encoding="utf-8") as f:
+            job = json.load(f)
+    except Exception as e:
+        print(f"resend-text-part: unreadable job: {_sanitize_error(e)}", flush=True)
+        return 1
+    plan = _text_plan(job)
+    if plan is None:
+        print("resend-text-part: job has no long-text plan, refusing", flush=True)
+        return 1
+    text = job.get("text") or ""
+    if job.get("full_text_sha256") != hashlib.sha256(text.encode("utf-8")).hexdigest():
+        print("resend-text-part: plan does not match top-level text, refusing (no reslicing)", flush=True)
+        return 1
+    part_no = args.part
+    if part_no < 1 or part_no > len(plan):
+        print(f"resend-text-part: part {part_no} out of range (1..{len(plan)})", flush=True)
+        return 1
+    part = plan[part_no - 1]
+    if part.get("status") in ("sent", "pending", "sending"):
+        print(f"resend-text-part: part {part_no} is already {part.get('status')}, refusing", flush=True)
+        return 1
+    if part.get("status") not in ("failed", "needs_check", "blocked_by_prior"):
+        print(f"resend-text-part: part {part_no} has unexpected status {part.get('status')!r}, refusing", flush=True)
+        return 1
+    part["status"] = "pending"
+    part["error_code"] = None
+    part["attempts"] = 0
+    job.pop("terminal", None)
+    job["delivery_state"] = "pending"
+    job.pop("needs_check_reason", None)
+    job["manual_resend_part"] = part_no - 1
+    job["manual_resend_ts"] = time.time()
+    dest = os.path.join(OUTBOX_PENDING, os.path.basename(path))
+    try:
+        atomic_write_json(path, job, mode=0o600)
+        if os.path.abspath(path) != os.path.abspath(dest):
+            os.replace(path, dest)
+    except Exception as e:
+        print(f"resend-text-part: write/move failed: {_sanitize_error(e)}", flush=True)
+        return 1
+    print(json.dumps({"job": os.path.basename(dest), "part": part_no,
+                      "parts_total": len(plan), "status": "pending"}, ensure_ascii=False), flush=True)
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="WeChat iLink bridge (text only, Phase 1)")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -5020,6 +5667,9 @@ def main(argv=None):
     p_send.add_argument("--context-token", default=None)
     p_send.add_argument("--client-id", default=None)
     sub.add_parser("status", help="Show bridge state without printing secrets")
+    p_resend = sub.add_parser("resend-text-part", help="Item 3: reset one long-text part to pending for manual resend (never reslices, never resends sent parts)")
+    p_resend.add_argument("job", help="Job filename in outbox/failed/ or outbox/pending/, or a full path")
+    p_resend.add_argument("part", type=int, help="1-based part number, as shown in [i/N]")
     sub.add_parser("verify-channel", help="Production Worker channel-recovery check (read-only JSON, exit 0 only if recovered)")
     sub.add_parser("safe-view", help="Print the deterministic safe history view (read-only JSON)")
     args = parser.parse_args(argv)
@@ -5030,6 +5680,8 @@ def main(argv=None):
         return serve_loop()
     if args.cmd == "status":
         return cmd_status(args)
+    if args.cmd == "resend-text-part":
+        return cmd_resend_text_part(args)
     if args.cmd == "safe-view":
         view = build_safe_history_view()
         print(json.dumps(view, ensure_ascii=False, indent=2))
