@@ -172,3 +172,14 @@ python3 bridge.py serve
 - 文件发送（新增 `send_file`）：上传 `media_type=3`、发送 `type=4` + `file_item`，首测以 WebM 原件作附件发送，手机下载后大小与 SHA-256 与原件一致，原件传输成功。
 - 已知限制（本版如实记录，不扩大）：WebM 作视频经 VIDEO 路上传被服务端拒绝（错误码 -5102031，全部已抓头的失败一致；VIDEO 链拒的是 WebM 容器本身，与编码、音频、重封装无关），属平台侧限制，绕法为 FILE 附件路径；HDR 仅以合成 HDR10 样片通过本地分析，实拍 HDR 与 HDR 手机播放未测；分析器证据的探测轨不含色彩字段；文件接收（类型 4 入站）本版未做，只做了发送。
 - bridge.py 4299 行，SHA-256 57caaba04debbb34b2480ce4f79e8c1c6c87df23ab32447b6a46e37f1a7e6be0。
+
+## v1.1.1（R2 P0 修补，2026-10-31，已部署并微信实测）
+
+- 文件附件显式分派：outbox 里 type=file 的附件不再掉进发图片的函数；未知 type 直接判失败，绝不猜。
+- 墓碑永久保留：删掉 90 天清除逻辑，被删的本地视频编号永远不会变回“未知”。
+- token 不进 Worker 可见记录：inbox/done 记录不再写 context_token；发送改用桥的 session token；任务归档到 sent/failed 之前先清掉 token；Worker 模板改读安全视图，不再读原始记录。
+- 测试修补：test_video_v1 的空断言与写死路径已修；新增 test_r2_p0（14 项）。
+- 分析器路径环境变量覆盖（WECHAT_BRIDGE_ANALYZER_PY / WECHAT_BRIDGE_ANALYZER_BASE），默认值不变，生产不用改配置。
+- 未照搬的 R2 要求：未知引用一律禁内联未采纳——会破坏已通过的引用测试 case 5/10（桥没见过的老消息的平台内联原文）；该威胁已由永久墓碑在另一层堵住。
+- 微信实测：一个不带 token 的 file 任务经新分派发出，附件形态与内容经用户手机确认。
+- bridge.py 4333 行，SHA-256 5a1faca1cf2d09a93eee2f22a5b0091b6e29121c3a24ab4f06943590211137b2。
