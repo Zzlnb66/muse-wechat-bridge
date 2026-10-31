@@ -1,5 +1,7 @@
 import base64, hashlib, http.server, json, os, subprocess, sys, threading
-sys.path.insert(0, "/home/hatch/workspace/wechat-bridge-fix")
+# R2 P0 F6: resolve the repo root from this file, never hardcode a
+# production checkout path (the old absolute path broke on any move).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import bridge as B
 
 ok = []
@@ -70,7 +72,10 @@ def fake_post(base, path, payload, session=None, authenticated=False, timeout=15
     if path.endswith("sendmessage"):
         m = payload["msg"]
         assert m["message_type"] == 2 and m["item_list"][0]["type"] == 5, m
-        assert m["item_list"][0]["video_item"]["video_size"] == len(B.aes_ecb_encrypt(open(vp, "rb").read(), b"\x00"*16)) or True
+        # R2 P0 F6: the old `or True` made this assertion vacuous.
+        # ECB+PKCS7 ciphertext length is key-independent, so the
+        # equality holds for whatever key send_video actually used.
+        assert m["item_list"][0]["video_item"]["video_size"] == len(B.aes_ecb_encrypt(open(vp, "rb").read(), b"\x00"*16))
         return {"message_id": "mid123"}
     raise AssertionError(path)
 B.post_json = fake_post
