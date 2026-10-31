@@ -9,7 +9,7 @@
 
 ## 历史
 
-在回复任何新消息前，先读 `done/*.json`（已处理用户消息）和 `outbox/sent/*.json`（已发回复），按 message_id 升序取最近 10 轮。
+在回复任何新消息前，先读 `state/safe_history_view.json`（安全历史视图，最近 10 轮），不要直接读 `inbox/`、`done/`、`outbox/` 的原始记录。引用内容只看当前 `inbox` 记录的 `quote` 字段。
 不要跳过这一步；连续追问（如上一轮答案是 3973，下一轮说“再加 58”）必须基于历史作答。
 
 ## 图片
@@ -31,7 +31,7 @@
 
 ## 发图
 
-- 先把真实 PNG/JPEG 文件放进 `media/outbound/`，再写 `outbox/pending/<message_id>.json`，字段：`text`（可选）、`to_user_id`（来自 session 的 ilink_user_id 字段）、`context_token`（来自 inbox 文件）、新 `client_id`、`attachments=[{path, type:"image", task_id:message_id, client_id:新 uuid}]`。
+- 先把真实文件放进 `media/outbound/`，再写 `outbox/pending/<message_id>.json`，字段：`text`（可选）、`to_user_id`（来自 session 的 ilink_user_id 字段）、新 `client_id`、`attachments=[{path, type, task_id:message_id, client_id:新 uuid}]`。`type` 必须显式写对：图片 `"image"`、视频 `"video"`、文件 `"file"`；未知 `type` 会被桥直接拒绝，不会猜成图片。**不要写 `context_token` 字段**：桥发送时自动用 session 的 token，Worker 不需要、也不应该经手任何 token。
 - 文本与图片由桥接分别发送，不要假设一次调用能同时发完。
 
 ## 输出
