@@ -880,16 +880,22 @@ def resolve_quote(quote):
     NEVER returns quoted text, title, or media info for a local-only or
     tombstoned target: the quoted target's content must not be resurrected
     through a quote. Unknown targets are marked unresolved, never guessed.
-    R2 evaluation note (2026-10-31): R2 proposed banning the inline
-    fallback for unknown ids outright, but that would break tested
-    quote-v1 cases 5/10 (a pre-bridge message quoted with platform
-    inline text, where there is no bridge record at all). The
-    protection against a deleted id aging into 'unknown' is instead
-    the permanent tombstone set (sweep_local_ttl never purges), so a
-    local-only/deleted id can never lose its guard. Unknown-id
-    inline text therefore only ever comes from messages the bridge
-    never handled, supplied by the platform in the quoting message
-    itself, not from resurrected local content."""
+    Explicit tradeoff (user decision 2026-10-31, GPT review 2026-10-31):
+    R2 proposed banning the inline fallback for unknown ids outright,
+    but that would break tested quote-v1 cases 5/10 (a pre-bridge
+    message quoted with platform inline text, where there is no bridge
+    record at all). The fallback is therefore KEPT, and its boundary is
+    stated, not hidden: a known local-only/deleted id is guarded by TWO
+    layers, the permanent tombstone set (sweep_local_ttl never purges)
+    AND the done record's local_only flag, and either layer alone
+    blocks the inline text. The residual risk is explicit: if BOTH
+    layers are lost for some id (record deleted or lost in a migration
+    with no tombstone backfilled), that id reads as unknown and its
+    platform-supplied inline text/title WILL be shown to the Worker.
+    That is an accepted tradeoff, not a guarantee that the risk is
+    fully closed; the backfill for pre-tombstone deletions (2026-10-30
+    batch) is tracked separately, and a future 'thorough deletion' mode
+    that removes ids entirely must remove this fallback first."""
     if not quote:
         return None
     qid = quote.get("quoted_message_id")
@@ -2613,14 +2619,33 @@ def save_pending_local_queries(items):
         return False
 
 
+DEFAULT_ANALYZER_PY = "/home/hatch/workspace/goals/muse-wechat-bridge/hidden_files/m0-component/venv/bin/python"
+
+
+def _resolve_analyzer_py():
+    """Analyzer parent interpreter: WECHAT_BRIDGE_ANALYZER_PY wins, an
+    empty value counts as unset, otherwise the m0 venv default. The
+    model stages always run under this same variable inside
+    analyzer/m2_analyzer.py, so both launch paths share one env."""
+    return os.environ.get("WECHAT_BRIDGE_ANALYZER_PY") or DEFAULT_ANALYZER_PY
+
+
 def start_local_analysis(video_path, video_message_id):
     """Launch the M2 analyzer in the background, outdir INSIDE the
     vault (never analysis/). Returns the outdir, or None on failure.
-    The caller must NOT block serve polling on this process."""
+    The caller must NOT block serve polling on this process.
+    GPT follow-up 2026-10-31: this path used to hard-code
+    sys.executable while queue_video_analysis used the env override;
+    both now resolve through _resolve_analyzer_py, falling back to
+    sys.executable only when the env value points nowhere."""
     outdir = os.path.join(LOCAL_VAULT_DIR, str(video_message_id), "analysis")
+    analyzer_py = _resolve_analyzer_py()
+    if not os.path.exists(analyzer_py):
+        print(f"local_analysis: analyzer python not found, falling back to sys.executable", flush=True)
+        analyzer_py = sys.executable
     try:
         os.makedirs(outdir, exist_ok=True)
-        subprocess.Popen([sys.executable, os.path.join(ROOT, "analyzer", "m2_analyzer.py"),
+        subprocess.Popen([analyzer_py, os.path.join(ROOT, "analyzer", "m2_analyzer.py"),
                           video_path, outdir],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
@@ -3003,8 +3028,12 @@ def queue_video_analysis(message_id, saved_videos):
     analyses = []
     analyzer = os.path.join(ROOT, "analyzer", "m2_analyzer.py")
     # R2 P0 F2-lite: same override variable as analyzer/m2_analyzer.py.
-    venv_py = os.environ.get("WECHAT_BRIDGE_ANALYZER_PY", "/home/hatch/workspace/goals/muse-wechat-bridge/hidden_files/m0-component/venv/bin/python")
+    # GPT follow-up 2026-10-31: an empty value counts as unset (an
+    # empty string used literally would silently skip every analysis).
+    venv_py = _resolve_analyzer_py()
     if not os.path.exists(analyzer) or not os.path.exists(venv_py):
+        if os.environ.get("WECHAT_BRIDGE_ANALYZER_PY"):
+            print(f"video_analysis: analyzer python not found, skipping: {venv_py}", flush=True)
         return analyses
     for idx, saved in enumerate(saved_videos or []):
         path = saved.get("path") if isinstance(saved, dict) else None
@@ -3125,6 +3154,38 @@ def _classify_delivery_error(e):
     return "needs_check", True
 
 
+def _scrub_job_token(path, job):
+    """Pop context_token and persist the job without it.
+
+    Returns True if the token-free job was persisted. On write failure
+    returns False and records a failures/ note (kind
+    token_scrub_failed, field names only, never the token value): the
+    caller still archives the job with its correct delivery state, but
+    the record must never be read as desensitized. A scrub failure and
+    a delivery failure are separate: this never resends anything."""
+    if job.pop("context_token", None) is None:
+        return True
+    try:
+        atomic_write_json(path, job, mode=0o600)
+        return True
+    except Exception as _e:
+        print(f"outbox: token scrub write failed for {path}: {_sanitize_error(_e)}", flush=True)
+        try:
+            _mid = os.path.basename(path)
+            if _mid.endswith(".json"):
+                _mid = _mid[:-5]
+            write_failure_record(
+                _mid,
+                "scrub",
+                {"kind": "token_scrub_failed",
+                 "archived_with_token_possible": True,
+                 "delivery_state": job.get("delivery_state")},
+            )
+        except Exception:
+            pass
+        return False
+
+
 def drain_outbox(session):
     """Send pending outbox files, each output item independently.
     Audit 3: text and each attachment have their own persisted ID,
@@ -3194,6 +3255,28 @@ def drain_outbox(session):
         if not job.get("to_user_id") and session.get("ilink_user_id"):
             job["to_user_id"] = session.get("ilink_user_id")
             changed = True
+        # GPT review 2026-10-31 (user decision: keep fallback, document
+        # tradeoff): a pending job may carry a to_user_id from an older
+        # login. Never send it under a different bound account: park it
+        # for manual check instead. The check re-fires on every drain,
+        # so even a kept-in-pending job can never slip through a send.
+        _session_user = session.get("ilink_user_id")
+        if job.get("to_user_id") and _session_user and job.get("to_user_id") != _session_user:
+            job["delivery_state"] = "needs_check"
+            job["needs_check_reason"] = "recipient_mismatch"
+            job["terminal"] = True
+            _TERMINAL_TASK_IDS.add(name)
+            try:
+                atomic_write_json(path, job, mode=0o600)
+            except Exception as _mm_e:
+                print(f"outbox: recipient-mismatch flag write failed for {name}: {_sanitize_error(_mm_e)}", flush=True)
+            try:
+                os.replace(path, os.path.join(OUTBOX_FAILED, name))
+                print(f"outbox: recipient mismatch {name} parked to failed/ (no send)", flush=True)
+            except OSError as _mm_e2:
+                print(f"outbox: recipient-mismatch move FAILED for {name}: {_sanitize_error(_mm_e2)}; kept in pending but marked terminal, will NOT resend", flush=True)
+            failed_names.append(name)
+            continue
         # R2 P0 (B2-lite): the bridge session owns context_token.
         # A pending job may still carry a Worker-copied token from
         # the old contract; prefer the live session token and fall
@@ -3336,13 +3419,14 @@ def drain_outbox(session):
             continue
         # R2 P0 (B2-lite): never archive a platform token into
         # sent/ or failed/, where the Worker could read it back.
-        # Best effort only: a scrub-write failure must not block
-        # delivery of an already-sent job.
-        if job.pop("context_token", None) is not None:
-            try:
-                atomic_write_json(path, job, mode=0o600)
-            except Exception as _scrub_e:
-                print(f"outbox: token scrub write failed for {name}: {_sanitize_error(_scrub_e)}", flush=True)
+        # GPT review 2026-10-31: a scrub-write failure must not block
+        # delivery of an already-sent job, but it must also never be
+        # reported as desensitized. The pending file on disk still
+        # carries the token, and the archive move below carries it
+        # into sent/failed/; _scrub_job_token records that durably in
+        # failures/ (field names only, never the token value) so the
+        # archived record is never mistaken for clean.
+        _scrub_job_token(path, job)
         if all_sent:
             os.replace(path, os.path.join(OUTBOX_SENT, name))
             sent_names.append(name)

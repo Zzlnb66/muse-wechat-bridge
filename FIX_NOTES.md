@@ -205,3 +205,45 @@
 - analyzer/m2_analyzer.py 的 VENV_PY 与 stages.py 的 BASE 改环境变量覆盖（WECHAT_BRIDGE_ANALYZER_PY / WECHAT_BRIDGE_ANALYZER_BASE），默认值不变；BASE 对环境变量值补齐末尾斜杠。
 - 未采纳：R2 未知引用禁内联原文。理由：会破坏引用测试 case 5/10（无桥记录老消息的平台内联展示）；本地视频消息本身无正文，且已知本地/墓碑目标本来就剥离内容，永久墓碑又堵住了“删过的编号过期变未知”这条路；resolve_quote docstring 已写明取舍。
 - bridge.py 4333 行，SHA-256 5a1faca1cf2d09a93eee2f22a5b0091b6e29121c3a24ab4f06943590211137b2；部署备份 bridge.py.bak-r2p0-20261031-0925。
+
+# v1.1.2 技术说明（部署已验证，微信实测已通过）
+
+来源：用户 2026-10-31 粘贴的 GPT 复核意见，Muse 逐项核实后按“保留回退，写明取舍”（用户 2026-10-31 决定）实施。GPT 未拿到 4333 行源码，只能审逻辑；本批改动以运行代码为准。
+
+## bridge.py（修复副本，部署前 4333 行，部署后 4417 行）
+
+- drain_outbox：to_user_id 补齐后新增收件人一致性检查。任务 to_user_id 与 session ilink_user_id 均非空且不一致时，置 delivery_state=needs_check、needs_check_reason=recipient_mismatch、terminal=True，移入 failed/，绝不发送；检查每轮重跑，滞留 pending 的任务也无法绕过。
+- 新增 `_scrub_job_token(path, job)`：弹出 token 并落盘；写失败返回 False 并经 write_failure_record 写 failures/<id>_scrub.json（kind=token_scrub_failed、archived_with_token_possible=True、delivery_state；不含 token 值）。调用方仍按正确投递状态归档，绝不因此重发。
+- 新增 `_resolve_analyzer_py()` 与 `DEFAULT_ANALYZER_PY`：`WECHAT_BRIDGE_ANALYZER_PY` 非空值优先，空值与未设置均走默认。queue_video_analysis 改用它，路径不存在时记日志跳过；start_local_analysis 改用它，路径不存在时回落 sys.executable 并记日志（此前硬编码 sys.executable）。
+- resolve_quote docstring：删除“本地/已删编号永远不会失去守卫”一说，改为显式取舍全文（两层保护 + 两层同失时的残留风险 + 彻底删除模式须先取消回退）。
+
+## analyzer/
+
+- m2_analyzer.py：VENV_PY 改为 `os.environ.get(...) or 默认值`（空值视为未设置）。
+- stages.py：BASE 改为 `os.environ.get(...) or 默认值`（空值视为未设置，默认自带末尾斜杠）。
+
+## 模板
+
+- examples/worker-prompt-template.md：历史一节新增引用取舍段落（占位规则 + 未知回退 + 两层保护 + 残留风险）。
+
+## 测试
+
+- 新增 tests/test_gpt_followup.py，20/20：收件人错配停发、收件人一致正常发送、解析器空值/未设置/已设置、本地分析路径回落与 honor、scrub 失败记 failures/ 且不含 token 值、scrub 成功落盘无 token、未知引用仍回退（取舍锁定）、墓碑无记录仍守卫。
+- 旧全套回归：引用 10/10、视频 FAILED: none、R2 P0 FAILED: none、v101/v102/v103、v104 四项、回归、R8 计时，全部通过（5 个测试需按文档传 bridge.py 路径参数，否则报参数缺失，与改动无关）。
+
+## 墓碑补录（已执行）
+
+- 编号：7521952422146222856、7521862777697967240（2026-10-30 删除批里两段本地视频的编号；同批其余 3 项为普通早餐视频的 inbound/analysis 及一段本地视频的 analysis 残留，不涉本地保护）。
+- 依据：部署前合成引用实测证明这两个编号目前靠 done 记录的 local_only 占位守卫；补录后即使 done 记录丢失仍被守卫挡住。补录后以合成引用复测一次。
+
+## 旧记录 token 迁移（已执行）
+
+- 部署前只读统计（仅字段名，不含值）：done 106 条、outbox/sent 179 条、outbox/failed 1 条，共 286 条；inbox、outbox/pending 为 0。
+- 执行顺序（已按此执行）：停 serve → 复制代码 → 补墓碑 → 原地清除上述 286 条记录的 context_token 字段 → 重启 serve（看门狗重拉）→ verify-channel 三次 recovered=true → 微信实测消息 7522129217093041288 正常往返。
+- 备份文件（bak-*）不改写，属本地 0600 文件，与 session.json 同一信任级别。
+
+## 仍未验证（不得写成已通过）
+
+- 生产 Worker 指令的 token 处理部分：v1.1.1 部署后尚无 Worker 经手的新回复可供行为验证（部署后唯一的 sent 任务是测试任务），下一次真实 Worker 回复后查其 sent 任务是否含 token 字段才能定论。
+- 收件人错配检查无单用户微信实测，以离线测试为准。
+- 文件入站（type 4 接收）仍未做；R2 其余大架构仍推迟；v1.1.2 Tag 未打。
