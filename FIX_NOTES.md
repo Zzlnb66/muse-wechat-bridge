@@ -257,3 +257,13 @@
 - 测试：tests/test_analyzer_recovery.py 23/23；test_gpt_followup.py 更新至 22/22；test_r2_p0.py 按新契约更新；旧全套全绿。
 - bridge.py 4654 行，SHA-256 40fc4b6daf99c2700bbf3c94dc480651539102ad693f2886e0d870c29b63fcec；部署备份 bridge.py.bak-item1-20261031-1151；部署后 serve PID 19440，verify-channel recovered=true。
 - 未验证：新代码下 OCR/ASR/声音全轨实跑；真实分析进程删除停树机制只在 sleep 进程上验证。
+
+# v1.2.0（第 2 项：普通文件接收，2026-10-31）
+
+- extract_file_items / process_inbound_file：URL 与视频同款解析、白名单仅微信 HTTPS、密钥严格解析、curl-only 下载（3 次重定向复验、2 次尝试共享 deadline）、上限 10MiB/文件、20MiB/消息、5 个、60 秒；展示名清理与回退、落盘 0600 原子写、file_receipts.json 收据复用。
+- serve_loop：纯文件不再丢；图片/视频全失败提示均加 and not file_items；仅本地模式开时文件走固定拒收（见 README 行为变化）；文件全失败且无其他内容 → “文件接收失败，请重发”提示、不进 inbox；record 新增 files[] 与 file_errors[]。
+- 安全视图：纯文件占位“附文件 N 个”；模板新增“文件”节。
+- 测试：tests/test_file_inbound.py 26/26；旧全套全绿。
+- bridge.py 5058 行，SHA-256 9d51a2b6e23e6b6232251ddb0a07a1857c81129ddd6fb19e0b53ba00724f08d1；部署备份 bridge.py.bak-item2-20261031-1247；部署后 serve PID 59954，verify-channel recovered=true。
+- 微信实测：PDF 与 txt 接收大小/哈希一致、Worker 正确报页数与大小、原样回传 SHA 一致（中间一次瞬时上传失败重试成功）。
+- 未验证：mime 仅“unknown”标签；不自动解包/执行/承诺解析所有格式；附件展示形态与直接播放未报。
