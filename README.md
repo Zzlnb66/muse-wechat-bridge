@@ -276,3 +276,28 @@ python3 bridge.py serve
 - 接收：PDF 7522157837819709064（1,246,614 字节，实测 PDF 1.4、5 页）与 file.txt 7522157843033248520（36 字节，一行 Windows 路径文字），done 的 files[] 大小与哈希一致、无 file_errors、收据两条；Worker 两条正式回复分别正确报出“约 1.2MB、5 页”与“36 字节、一行路径文字”，证明读的是文件本身。首次真实 type=4 媒体解密在实践中成立。
 - 回传：用户要求两文件原封不动发回，出站前按原名复制到 media/outbound/，SHA 与接收收据核对一致；文字与两附件最终均 sent。中间一次瞬时失败（PDF 首次上传 http=100、x-encrypted-param 缺失，标 retryable），下一轮重试成功，最终态 sent 而非 failed。
 - **未验证**：record 的 mime 字段仅为“unknown”标签；收到文件不等于已读懂文件（不自动解包、不执行、不承诺解析所有格式）；附件在手机端的展示形态与能否直接播放用户未报。
+
+# v1.3.0（第 3 项：长文分段，2026-10-31，已部署并微信实测）
+
+本节为第 3 项的发布说明。基线为第 2 项发布内容；分析器与第 1 项相同，本次不重传。
+
+## 改了什么
+
+- **分段计划保存在同一个 outbox 作业文件内**：text_plan_version=1、text_parts[]（index、raw_slice、display_text、sha256、固定 client_id、status pending/sent/failed/needs_check、attempts、error_code）、full_text_sha256；顶层 text 保留全文供历史读取，新 sender 只遍历 text_parts。不能只在 send_text() 内循环切片。
+- **发送顺序与失败语义**：发送前先持久化计划（写失败零网络调用），每段发送前先持久化 sending、成功后立即持久化 sent；结果未知 → 该段 needs_check，后续段 blocked_by_prior 且附件全部停止，整作业进 failed 供人工核对；发送成功但落盘失败 → 本进程 HALT 该 job，重启残留 sending 走 needs_check；全部文本 sent 后才发附件。
+- **分段规则**：显示预算 1800 字符（段号 [i/N] 与补的围栏一并计入，段号预算按最大 “[20/20]” 8 字预留）；只按换行切行保证拼接精确还原；围栏按行跟踪（反引号/波浪号、长度≥3、info_string），跨段补闭合与重开（闭合行不带 info_string、重开行带原 info_string）；超长无换行代码行做结合字符/ZWJ 安全字符切；最多 20 段，超出在发送前拒绝并提示改文件交付。
+- **安全历史与人工补发**：部分送达在安全历史里显示 delivery_status 与待核对段号，不得让 Worker 以为用户已读完整答案；新增 CLI `bridge.py resend-text-part <job> <1-based 段号>`（只重置指定一段为 pending 并清 attempts、清 terminal 标记、移回 pending，拒绝 sent/pending/sending 段与哈希不符的计划）。
+- **兼容与回滚（必读）**：旧 job 的 sent/failed/needs_check 绝不重分段，只有可证明从未尝试的旧长文本才可离线升级；旧 sender 不认识新字段，会把顶层全文再发一次——回滚前必须隔离所有新格式 pending/failed 任务。
+- **四处有意偏离/补齐方案原文**：段落优先仅在回切空白行仍保留 ≥60% 内容预算时采用（方案只给顺序未给阈值）；永久失败段同样挡尾（方案只明说未知，但发 [3/N] 缺 [2/N] 无意义）；被挡尾段在挡路段补发成功后自动按序续发（人工只碰一段，否则尾段永久卡死）；补发时 drain 须把该 job 移出长驻 serve 的内存终态集合，否则归档它的 serve 会把补发任务直接再归档（新测试抓到并已修）。
+
+## 测试
+
+- 新增 tests/test_long_text.py，41/41（含方案核心验收：第 2 段未知 → 第 1 段不重发、第 3 段与附件零调用、进 failed、状态 sent/needs_check/blocked_by_prior；另含围栏闭合无 info、超长行、>20 段拒绝、重试段、可补发且 sent 段拒绝补发、旧已尝试 job 不重分段、重启恢复、落盘失败 HALT、短文走旧路）；旧全套全绿。
+- bridge.py 5710 行，SHA-256 836bbce81b7ebe8f79d02dc9bec5be51a1000f6d8de1dbb85e2db2740e1477d6。
+
+## 微信实测
+
+- 第 1 步：两段合成文字，回复 1935 字，计划 v1，共 2 段（展示 1642、305 字，均 sent，拼接一致，无代码围栏）。
+- 第 2 步重测（围栏横跨段界）：回复 3000 字，计划 v1，共 3 段（展示 1758、1135、139 字，均 sent，拼接一致）；围栏开口在全文 1487 字、闭口在 2862 字，第 1 段原片仅含开口、展示补无 info 的闭口，第 2 段以 ```python 重开并含原闭口，第 3 段为纯散文，跨段围栏属实。用户在手机端确认“都没问题”。
+- 第 3 步重测（分段长文后附件）：回复 1871 字（过阈值），计划 v1，共 2 段（展示 1518、365 字，均 sent，拼接一致），附件 long_text_attachment_step3_redo.txt（type=file）已 sent，文字段在前、附件在后。用户在手机端确认“都没问题”。
+- 注意：初次第 2、3 步未命中新路径（围栏整段落在第 1 段内；回复仅 1510 字未触发分段），已按重测结果结项，初次结果不作通过证据。

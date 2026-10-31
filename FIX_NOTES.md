@@ -267,3 +267,14 @@
 - bridge.py 5058 行，SHA-256 9d51a2b6e23e6b6232251ddb0a07a1857c81129ddd6fb19e0b53ba00724f08d1；部署备份 bridge.py.bak-item2-20261031-1247；部署后 serve PID 59954，verify-channel recovered=true。
 - 微信实测：PDF 与 txt 接收大小/哈希一致、Worker 正确报页数与大小、原样回传 SHA 一致（中间一次瞬时上传失败重试成功）。
 - 未验证：mime 仅“unknown”标签；不自动解包/执行/承诺解析所有格式；附件展示形态与直接播放未报。
+
+# v1.3.0（第 3 项：长文分段，2026-10-31）
+
+- 分段器：只按换行切行、围栏逐行跟踪、段落优先 60% 阈值、超长行结合字符/ZWJ 安全切、段号预算按最大 “[20/20]” 8 字预留、最多 20 段、raw 拼接精确还原。
+- drain：计划先落盘、逐段 sending/sent 落盘、未知/失败挡尾、重试段 attempts 上限 3 次、附件等全文段、全 sent 后 text_status 置 sent；_is_terminal_job 计划感知；recover 把残留 sending 段改 needs_check 并挡尾；安全历史部分送达占位。
+- resend-text-part：只重置指定一段，拒绝 sent/pending/sending 段与哈希不符计划；补发时移出长驻 serve 内存终态集合。
+- 旧 job 升级条件 _plan_never_attempted（text_status 未终态、text_attempts=0、附件未尝试）。
+- 测试：tests/test_long_text.py 41/41；旧全套全绿（analyzer 23/23、file_inbound 26/26、gpt_followup 22/22、quote 10/10、r2/video FAILED: none）。
+- bridge.py 5710 行，SHA-256 836bbce81b7ebe8f79d02dc9bec5be51a1000f6d8de1dbb85e2db2740e1477d6；部署备份 bridge.py.bak-item3-20261031-1317；部署后 serve PID 83633，verify-channel recovered=true。
+- 微信实测：两段合成文字、围栏横跨 3 段、分段长文后附件，三步均通过（初次第 2、3 步未命中新路径，已重测）。
+- 回滚警告：旧 sender 会把顶层全文再发一次，回滚前必须隔离所有新格式 pending/failed 任务。
