@@ -80,7 +80,7 @@ Music >= 0.50 while Speech < 0.20). Narrative v1 (build_narrative) only
 reorders those tracks by time into narrative.md; it does NOT claim
 speaker identity, lyric content, or pure-instrumental status.
 Uninspected ranges are listed explicitly.
-Usage: venv_python m2_analyzer.py <video> <outdir>
+Usage: python m2_analyzer.py <video> <outdir> [--run-id ID]
 Output: <outdir>/evidence.json (+ frames/, stage jsons, audio_16k.wav)
 """
 import hashlib
@@ -89,11 +89,19 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# R2 P0 F2-lite: overridable via environment, default unchanged,
-# so the production install keeps working with no config change.
-VENV_PY = os.environ.get("WECHAT_BRIDGE_ANALYZER_PY") or "/home/hatch/workspace/goals/muse-wechat-bridge/hidden_files/m0-component/venv/bin/python"
+# Item 1 (2026-10-31): stages ALWAYS run under this analyzer's own
+# sys.executable. The old VENV_PY (re-read from the environment) is
+# gone on purpose: when the bridge fell back to its own interpreter,
+# the child inherited the stale invalid value and every stage died
+# with FileNotFoundError. The bridge launcher now validates the
+# interpreter by execution and passes the selected one via the
+# environment, so the analyzer's sys.executable IS the selection.
+# WECHAT_BRIDGE_ANALYZER_BASE is still honoured by stages.py for
+# model files.
+STAGE_PY = sys.executable
 
 
 def sha256_file(path):
@@ -127,48 +135,142 @@ def gate():
         time.sleep(2)
 
 
-def run_stage(stage, args, outdir):
+def _atomic_write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def _validate_stage_output(outp, expected_run_id, returncode):
+    """Validate one stage output file. Returns (ok, error_category).
+
+    A stage counts as completed ONLY on: exit 0, a fresh valid JSON
+    object, _status completed, and a matching _run_id echo when one
+    was requested. Anything else is a structured failure, never an
+    exception and never a stale file mistaken for a fresh result."""
+    if returncode != 0:
+        try:
+            data = json.load(open(outp, encoding="utf-8"))
+            if isinstance(data, dict) and data.get("_status") == "failed":
+                return False, data.get("_error") or "stage_failed"
+        except Exception:
+            pass
+        return False, "nonzero_no_output" if not os.path.exists(outp) else "nonzero_output"
+    if not os.path.exists(outp):
+        return False, "no_output"
+    try:
+        data = json.load(open(outp, encoding="utf-8"))
+    except Exception:
+        return False, "bad_json"
+    if not isinstance(data, dict):
+        return False, "bad_json"
+    if expected_run_id and data.get("_run_id") != expected_run_id:
+        return False, "run_id_mismatch"
+    if data.get("_status") != "completed":
+        return False, data.get("_error") or "stage_failed"
+    return True, None
+
+
+def run_stage(stage, args, outdir, run_id=None, timeout=600):
+    """Run one stage as its own process group, with structured errors.
+
+    The previous run's output file is deleted BEFORE launch, so a
+    killed stage can never leave a stale file that reads as fresh.
+    Spawn failure, timeout (whole process group killed), non-zero exit,
+    missing/bad output, and run_id mismatch all become a failed result
+    dict; this function never raises for a stage problem."""
     inp = os.path.join(outdir, f"stage_{stage}_in.json")
     outp = os.path.join(outdir, f"stage_{stage}.json")
-    json.dump(args, open(inp, "w", encoding="utf-8"), ensure_ascii=False)
-    r = subprocess.run([VENV_PY, os.path.join(HERE, "stages.py"), stage, inp, outp],
-                       capture_output=True, timeout=600)
-    if os.path.exists(outp):
+    try:
+        os.remove(outp)
+    except OSError:
+        pass
+    args = dict(args)
+    if run_id:
+        args["_run_id"] = run_id
+    try:
+        _atomic_write_json(inp, args)
+    except Exception as e:
+        return {"_stage": stage, "_status": "failed", "_error": "input_write_failed",
+                "_error_detail": type(e).__name__, "_peak_rss_kib": None}
+    try:
+        proc = subprocess.Popen([STAGE_PY, os.path.join(HERE, "stages.py"), stage, inp, outp],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        return {"_stage": stage, "_status": "failed", "_error": "spawn_failed",
+                "_error_detail": type(e).__name__, "_peak_rss_kib": None}
+    try:
+        returncode = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, 9)
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
+        return {"_stage": stage, "_status": "failed", "_error": "timeout",
+                "_peak_rss_kib": None}
+    ok, err = _validate_stage_output(outp, run_id, returncode)
+    if ok:
         return json.load(open(outp, encoding="utf-8"))
-    return {"_stage": stage, "_status": "failed", "_error": "no_output", "_peak_rss_kib": None}
+    result = {"_stage": stage, "_status": "failed", "_error": err, "_peak_rss_kib": None}
+    try:
+        data = json.load(open(outp, encoding="utf-8"))
+        if isinstance(data, dict) and data.get("_error_detail"):
+            result["_error_detail"] = data["_error_detail"]
+    except Exception:
+        pass
+    return result
 
 
-def main(video, outdir):
+def _main_inner(video, outdir, run_id):
     os.makedirs(outdir, exist_ok=True)
     framedir = os.path.join(outdir, "frames")
     ev = {"schema_version": "m2-evidence-0.1",
+          "run_id": run_id,
           "video_sha256": sha256_file(video),
           "video_bytes": os.path.getsize(video),
-          "stages": {}, "completed_tracks": [], "uninspected_ranges": [],
+          "stages": {}, "completed_tracks": [], "failed_tracks": [],
+          "skipped_tracks": [], "uninspected_ranges": [],
           "conflicts": [], "fusion_notes": []}
     # 1. probe (light)
-    probe = run_stage("probe", {"video": video}, outdir)
+    probe = run_stage("probe", {"video": video}, outdir, run_id)
     ev["stages"]["probe"] = probe
     if probe.get("_status") == "completed":
         ev["completed_tracks"].append("probe")
         fmt = probe.get("probe", {}).get("format", {})
         ev["duration_s"] = float(fmt.get("duration", 0) or 0)
     else:
+        ev["failed_tracks"].append("probe")
         ev["uninspected_ranges"].append({"track": "probe", "reason": probe.get("_error")})
     # 2. frames (light)
-    frames = run_stage("frames", {"video": video, "outdir": framedir}, outdir)
+    frames = run_stage("frames", {"video": video, "outdir": framedir}, outdir, run_id)
     ev["stages"]["frames"] = frames
     if frames.get("_status") == "completed":
         ev["completed_tracks"].append("frames")
     else:
+        ev["failed_tracks"].append("frames")
         ev["uninspected_ranges"].append({"track": "frames", "reason": frames.get("_error")})
-    # 3. audio extract (light, ffmpeg)
+    # 3. audio extract (light, ffmpeg). A missing ffmpeg, a timeout, or
+    # any spawn error used to kill the whole run; it is now a failed
+    # audio track, and asr/sound are skipped on it, not crashed on.
     wav = os.path.join(outdir, "audio_16k.wav")
-    r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", video, "-vn", "-ac", "1",
-                        "-ar", "16000", "-c:a", "pcm_s16le", wav], capture_output=True, timeout=120)
-    ev["audio_16k_extracted"] = bool(r.returncode == 0 and os.path.exists(wav) and os.path.getsize(wav) > 0)
+    try:
+        r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", video, "-vn", "-ac", "1",
+                            "-ar", "16000", "-c:a", "pcm_s16le", wav], capture_output=True, timeout=120)
+        ev["audio_16k_extracted"] = bool(r.returncode == 0 and os.path.exists(wav) and os.path.getsize(wav) > 0)
+        _audio_err = None if ev["audio_16k_extracted"] else "ffmpeg 16k extract failed"
+    except Exception as e:
+        ev["audio_16k_extracted"] = False
+        _audio_err = type(e).__name__
     if not ev["audio_16k_extracted"]:
-        ev["uninspected_ranges"].append({"track": "audio", "reason": "ffmpeg 16k extract failed"})
+        ev["failed_tracks"].append("audio")
+        ev["uninspected_ranges"].append({"track": "audio", "reason": _audio_err})
     # 4. gate for heavy stages
     decision, mem, waits = gate()
     ev["gate"] = {"decision": decision, "mem_available_kib": mem, "waits": waits,
@@ -177,30 +279,43 @@ def main(video, outdir):
     if decision == "REJECT":
         for s in heavy:
             ev["stages"][s] = {"_stage": s, "_status": "skipped_gate"}
+            ev["skipped_tracks"].append(s)
             ev["uninspected_ranges"].append({"track": s, "reason": "gate_reject"})
     else:
         # ocr (needs frames)
         if frames.get("_status") == "completed":
-            ocr = run_stage("ocr", {"frames": frames["frames"], "framedir": framedir}, outdir)
+            ocr = run_stage("ocr", {"frames": frames["frames"], "framedir": framedir}, outdir, run_id)
             ev["stages"]["ocr"] = ocr
             if ocr.get("_status") == "completed":
                 ev["completed_tracks"].append("ocr")
             else:
+                ev["failed_tracks"].append("ocr")
                 ev["uninspected_ranges"].append({"track": "ocr", "reason": ocr.get("_error")})
+        else:
+            ev["stages"]["ocr"] = {"_stage": "ocr", "_status": "skipped"}
+            ev["skipped_tracks"].append("ocr")
+            ev["uninspected_ranges"].append({"track": "ocr", "reason": "frames_failed"})
         # asr + sound (need audio)
         if ev["audio_16k_extracted"]:
-            asr = run_stage("asr", {"audio_16k_wav": wav}, outdir)
+            asr = run_stage("asr", {"audio_16k_wav": wav}, outdir, run_id)
             ev["stages"]["asr"] = asr
             if asr.get("_status") == "completed":
                 ev["completed_tracks"].append("asr")
             else:
+                ev["failed_tracks"].append("asr")
                 ev["uninspected_ranges"].append({"track": "asr", "reason": asr.get("_error")})
-            sound = run_stage("sound", {"audio_16k_wav": wav}, outdir)
+            sound = run_stage("sound", {"audio_16k_wav": wav}, outdir, run_id)
             ev["stages"]["sound"] = sound
             if sound.get("_status") == "completed":
                 ev["completed_tracks"].append("sound")
             else:
+                ev["failed_tracks"].append("sound")
                 ev["uninspected_ranges"].append({"track": "sound", "reason": sound.get("_error")})
+        else:
+            for s in ("asr", "sound"):
+                ev["stages"][s] = {"_stage": s, "_status": "skipped"}
+                ev["skipped_tracks"].append(s)
+                ev["uninspected_ranges"].append({"track": s, "reason": "no_audio"})
     # 5. fusion (deterministic only)
     import re
     ocr_frames = ev["stages"].get("ocr", {}).get("ocr_frames", []) if isinstance(ev["stages"].get("ocr"), dict) else []
@@ -235,13 +350,96 @@ def main(video, outdir):
         ev["uninspected_ranges"].append({"track": "ocr", "reason": "not_completed"})
     # Narrative v1: deterministic timeline only, written next to evidence.
     ev["narrative_file"] = "narrative.md"
-    json.dump(ev, open(os.path.join(outdir, "evidence.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-    with open(os.path.join(outdir, "narrative.md"), "w", encoding="utf-8") as f:
+    _atomic_write_json(os.path.join(outdir, "evidence.json"), ev)
+    _narr_tmp = os.path.join(outdir, "narrative.md.tmp")
+    with open(_narr_tmp, "w", encoding="utf-8") as f:
         f.write(build_narrative(ev))
+    os.replace(_narr_tmp, os.path.join(outdir, "narrative.md"))
     print(json.dumps({"completed_tracks": ev["completed_tracks"], "gate": ev["gate"],
                       "conflicts": len(ev["conflicts"]),
                       "uninspected": ev["uninspected_ranges"]}, ensure_ascii=False, indent=2))
+    return ev
+
+
+def _stale_clean_outdir(outdir):
+    """Remove only files this analyzer owns, so a retry can never read
+    a previous run's stage output, evidence, frames, or state as its
+    own. The outdir layout itself is unchanged: evidence.json,
+    frames/, and stage jsons stay where the Worker already reads them."""
+    import glob
+    for pat in ("stage_*.json", "evidence.json", "narrative.md", "state.json"):
+        for p in glob.glob(os.path.join(outdir, pat)):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    frames_dir = os.path.join(outdir, "frames")
+    if os.path.isdir(frames_dir):
+        for p in glob.glob(os.path.join(frames_dir, "frame_*.jpg")):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def _write_run_state(outdir, run_id, video, state, completed, failed, skipped, reasons, started_ts):
+    try:
+        sha = sha256_file(video)
+    except Exception:
+        sha = None
+    doc = {"schema_version": "m2-run-state-0.1", "run_id": run_id,
+           "input_sha256": sha, "state": state,
+           "completed_tracks": completed, "failed_tracks": failed,
+           "skipped_tracks": skipped, "reason_codes": reasons,
+           "started_at": started_ts, "finished_at": time.time()}
+    try:
+        _atomic_write_json(os.path.join(outdir, "state.json"), doc)
+    except Exception:
+        pass
+    return doc
+
+
+def main(video, outdir, run_id=None):
+    """Run one analysis to a terminal state. Never leaves a run without
+    state.json: completed (all attempted tracks done), partial (some
+    done, some failed/skipped, evidence published), or failed (crash
+    before evidence). Evidence is published before the state file, and
+    readers must only accept evidence whose state is terminal and whose
+    run_id matches (legacy runs without state.json keep the old
+    evidence-existence behavior)."""
+    run_id = run_id or "run-%d-%s" % (time.time_ns(), uuid.uuid4().hex[:8])
+    started = time.time()
+    os.makedirs(outdir, exist_ok=True)
+    _stale_clean_outdir(outdir)
+    try:
+        ev = _main_inner(video, outdir, run_id)
+    except Exception as e:
+        _write_run_state(outdir, run_id, video, "failed", [], [],
+                         ["crash:" + type(e).__name__], started)
+        raise
+    failed = ev.get("failed_tracks", [])
+    skipped = ev.get("skipped_tracks", [])
+    completed = ev.get("completed_tracks", [])
+    # Gate-skipped or dependency-skipped tracks are unavailable work,
+    # not completed work: a run with light tracks done but heavy
+    # tracks skipped is partial, never completed.
+    if not completed:
+        state = "failed"
+    elif failed or skipped:
+        state = "partial"
+    else:
+        state = "completed"
+    reasons = ["failed:" + t for t in failed] + ["skipped:" + t for t in skipped]
+    ev["state"] = state
+    _atomic_write_json(os.path.join(outdir, "evidence.json"), ev)
+    _write_run_state(outdir, run_id, video, state, completed, failed, skipped, reasons, started)
+    return ev
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2])
+    _video = sys.argv[1]
+    _outdir = sys.argv[2]
+    _rid = None
+    if len(sys.argv) >= 5 and sys.argv[3] == "--run-id":
+        _rid = sys.argv[4]
+    main(_video, _outdir, _rid)

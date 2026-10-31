@@ -1,5 +1,6 @@
 """M2 stage runners, one stage per process.
-Usage: venv_python stages.py <stage> <input_json> <output_json>
+Usage: python stages.py <stage> <input_json> <output_json>
+(Run under the analyzer's own interpreter; see m2_analyzer.py item 1.)
 Each runner prints its own peak RSS (ru_maxrss) into the output.
 Stages: probe, frames, ocr, asr, sound.
 - probe/frames use ffmpeg/ffprobe (light, no model).
@@ -136,5 +137,12 @@ if __name__ == "__main__":
     except Exception as e:
         result = {"_stage": stage, "_peak_rss_kib": peak_kib(), "_status": "failed",
                   "_error": type(e).__name__, "_error_detail": str(e)[:300]}
-    json.dump(result, open(out_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    if args.get("_run_id"):
+        result["_run_id"] = args["_run_id"]
+    # Atomic write (item 1): a killed stage must never leave a
+    # half-written output that the next read mistakes for a result.
+    tmp_path = out_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, out_path)
     sys.exit(0 if result["_status"] == "completed" else 1)
