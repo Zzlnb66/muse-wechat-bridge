@@ -1,0 +1,79 @@
+# wechat-bridge.service — OPTIONAL systemd hosting template (v1.5.0 item 3).
+#
+# TEMPLATE ONLY, NOT ENABLED: this file is delivered uninstalled.
+# Copy it to /etc/systemd/system/, replace every <PLACEHOLDER>,
+# then `systemctl daemon-reload`. Syntax check only proves the unit
+# parses; it does NOT prove hosting acceptance (see SYSTEMD-NOTES.md).
+# Release notes must retain "systemd hosting unverified".
+#
+# EXCLUSIVITY (read before enabling): systemd and the Muse watchdog
+# Hook are ALTERNATIVES FOR SERVE STARTUP OWNERSHIP ONLY. The Hook's
+# inbox detection, Worker wake-up, heartbeat and alerting duties are
+# RETAINED in systemd mode. In systemd mode, remove any direct
+# nohup/setsid serve-launch paths from Worker prompts and scripts and
+# use this unit as the single fixed management entry. Never enable
+# both serve launchers at once: flock prevents a second serve from
+# polling, but systemd would then restart-loop on the lock failure
+# and flood the journal. See SYSTEMD-NOTES.md for the inventory and
+# maintenance-state steps that must come first.
+#
+# flock LIMIT: flock constrains only the same lock file. A different
+# deploy root, an inconsistent lock path, or replacing the lock file
+# while a live instance holds it can all bypass it. NEVER delete a
+# live instance's lock file.
+#
+# Exit codes (serve entry, production-verified for 2 and 3):
+#   2  = another serve holds serve.lock (lock conflict)
+#   3  = pre-start NEEDS_RELOGIN exists, or session missing/invalid
+#   14 = run-time TokenExpired (-14) stop
+#        (code-comment supported; RE-VERIFY against the serve entry's
+#        actual return value before finalising this unit — see notes)
+# RestartPreventExitStatus covers the unrecoverable states above so
+# on-failure does not restart-loop them. It applies to the main
+# ExecStart process only and cannot cover every ExecStartPre failure.
+# Protocol ret=-14 is NOT a process exit code; do not confuse them.
+# Note: on-failure does not restart on normal exit or regular SIGTERM.
+#
+# Deliberately NOT set (see notes for why):
+#   ProtectHome=yes — the deploy root, interpreter and models may
+#     live under /home; enable only after testing an access list.
+#   WatchdogSec — no notification protocol is implemented.
+#   ProtectSystem/ReadWritePaths/PrivateTmp — enable only after
+#     testing against the actual access list.
+#
+# Type=exec means "the process started executing", NOT "the WeChat
+# channel recovered". After any start, still check verify-channel
+# for recovered=true. Type=exec needs a systemd version that
+# supports it; on older versions use Type=simple instead.
+
+[Unit]
+Description=Muse WeChat bridge (iLink serve loop)
+After=network-online.target
+Wants=network-online.target
+# Start-limit directives live in [Unit] on modern systemd; putting
+# them in [Service] makes systemd ignore them with a warning
+# ("Unknown key name 'StartLimitIntervalSec'"), which is exactly
+# how a restart limit silently stops working.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/python3 <BRIDGE_ROOT>/bridge.py serve
+WorkingDirectory=<BRIDGE_ROOT>
+User=<DEPLOY_USER>
+Group=<DEPLOY_GROUP>
+# Uncomment and fill in only if the deploy environment needs them.
+# Do NOT put tokens, passwords or session contents here.
+#Environment=HTTPS_PROXY=<PROXY_IF_NEEDED>
+#Environment=HTTP_PROXY=<PROXY_IF_NEEDED>
+UMask=0077
+NoNewPrivileges=yes
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=2 3 14
+TimeoutStopSec=30
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
