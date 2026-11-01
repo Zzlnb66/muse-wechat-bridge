@@ -22,6 +22,9 @@ Base URL: https://ilinkai.weixin.qq.com
 Hard rules implemented here (do not weaken without user approval):
   1. Check ret AND errcode on every API response. -14 means token/session
      expired: write state/NEEDS_RELOGIN and exit, never retry in a loop.
+     getupdates failures are also bucketed (desensitised counts only)
+     in state/getupdates_anomalies.json; see
+     docs/getupdates-anomalies-manual.md.
      For sendMessage, a non-zero ret is an error. An empty / non-JSON
      response is also treated as failure, never as success (stricter than
      the official plugin, which does not check an absent ret on send).
@@ -49,7 +52,9 @@ Hard rules implemented here (do not weaken without user approval):
      itself is never re-run because a send failed.
 
 Runtime dependencies (D4 correction): Python standard library plus
-Pillow (image full decode), system openssl (AES-128-ECB), system curl
+Pillow (image full decode), pycryptodome (in-process AES-128-ECB,
+Gate 2 switch; system openssl is kept installed only as rollback and
+is no longer used for AES), system curl
 (preferred transport and image curl fallback). The venv in this folder
 is used only to render a QR-code PNG at login time (qrcode package).
 Final sendmessage is NOT auto-retried on unknown result (see R1);
@@ -83,25 +88,48 @@ import urllib.parse
 import urllib.request
 import uuid
 
+# Gate 2 (2026-11-01): in-process AES-128-ECB lives in the sibling
+# module aes_inprocess.py, which must be copied next to bridge.py at
+# deploy time. pycryptodome is REQUIRED: if it is missing, this import
+# fails loudly and bridge.py does not start; it never silently falls
+# back to the openssl subprocess, which would hide the missing
+# dependency and put key bytes back into a command-line argv.
+if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from aes_inprocess import (  # noqa: E402
+    aes_inprocess_decrypt,
+    aes_inprocess_decrypt_nopad,
+    aes_inprocess_encrypt,
+)
+
+# Gate 3 step 1: pure storage primitives live in bridge_storage.py
+# (same deploy rule as aes_inprocess.py: must sit next to bridge.py).
+import bridge_storage  # noqa: E402
+from bridge_storage import atomic_write_json, atomic_write_text  # noqa: E402
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
-STATE = os.path.join(ROOT, "state")
-INBOX = os.path.join(ROOT, "inbox")
-RUNNING = os.path.join(ROOT, "running")
-DONE = os.path.join(ROOT, "done")
-OUTBOX_PENDING = os.path.join(ROOT, "outbox", "pending")
-OUTBOX_SENT = os.path.join(ROOT, "outbox", "sent")
-OUTBOX_FAILED = os.path.join(ROOT, "outbox", "failed")
-MEDIA_INBOUND = os.path.join(ROOT, "media", "inbound")
-ANALYSIS_DIR = os.path.join(ROOT, "analysis")
-LOCAL_VAULT_DIR = os.path.join(ROOT, "local_vault")
-LOCAL_ONLY_MODE_FILE = os.path.join(STATE, "local_only_mode.json")
-PENDING_LOCAL_QUERIES_FILE = os.path.join(STATE, "pending_local_queries.json")
-TTL_INDEX_FILE = os.path.join(STATE, "local_ttl_index.json")
-TOMBSTONE_FILE = os.path.join(STATE, "local_tombstones.json")
+# All path constants below are bindings to one derivation: changing
+# ROOT (a second instance, a test copy) re-derives every path. Keep
+# these names as plain module attributes: tests rebind them per root.
+_PATHS = bridge_storage.paths_for_root(ROOT)
+STATE = _PATHS.state
+INBOX = _PATHS.inbox
+RUNNING = _PATHS.running
+DONE = _PATHS.done
+OUTBOX_PENDING = _PATHS.outbox_pending
+OUTBOX_SENT = _PATHS.outbox_sent
+OUTBOX_FAILED = _PATHS.outbox_failed
+MEDIA_INBOUND = _PATHS.media_inbound
+ANALYSIS_DIR = _PATHS.analysis_dir
+LOCAL_VAULT_DIR = _PATHS.local_vault_dir
+LOCAL_ONLY_MODE_FILE = _PATHS.local_only_mode_file
+PENDING_LOCAL_QUERIES_FILE = _PATHS.pending_local_queries_file
+TTL_INDEX_FILE = _PATHS.ttl_index_file
+TOMBSTONE_FILE = _PATHS.tombstone_file
 LOCAL_TTL_SECONDS = 48 * 3600
-MEDIA_OUTBOUND = os.path.join(ROOT, "media", "outbound")
-FAILURES_DIR = os.path.join(ROOT, "failures")
-IMAGE_EVENT_FILE = os.path.join(STATE, "last_image_event.json")
+MEDIA_OUTBOUND = _PATHS.media_outbound
+FAILURES_DIR = _PATHS.failures_dir
+IMAGE_EVENT_FILE = _PATHS.image_event_file
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
 MAX_VIDEO_PLAIN_BYTES = 100 * 1024 * 1024
 MAX_VIDEO_CIPHER_BYTES = MAX_VIDEO_PLAIN_BYTES + 16
@@ -109,28 +137,38 @@ MAX_VIDEO_CIPHER_BYTES = MAX_VIDEO_PLAIN_BYTES + 16
 # trial-run values for the synchronous receive path, NOT WeChat
 # platform limits. A larger capacity needs the streaming/background
 # download version, not a bigger constant here.
-FILE_INBOUND_DIR = os.path.join(MEDIA_INBOUND, "files")
+FILE_INBOUND_DIR = _PATHS.file_inbound_dir
 FILE_SINGLE_PLAIN_CAP = 10 * 1024 * 1024
 FILE_SINGLE_CIPHER_CAP = FILE_SINGLE_PLAIN_CAP + 1024
 FILE_MESSAGE_TOTAL_CAP = 20 * 1024 * 1024
 FILE_MESSAGE_MAX_COUNT = 5
 FILE_MESSAGE_BUDGET_SECONDS = 60
 FILE_DOWNLOAD_ATTEMPTS = 2
-FILE_RECEIPTS_FILE = os.path.join(STATE, "file_receipts.json")
+FILE_RECEIPTS_FILE = _PATHS.file_receipts_file
 # Test-only hook: extra allowed media origins for local test servers,
 # e.g. {("http", "127.0.0.1", 8765)}. Empty in production; never put
 # an HTTP localhost allowlist into the production configuration.
 _TEST_MEDIA_ORIGINS = set()
 MAX_IMAGE_PIXELS = 50_000_000
 CDN_BASE_DEFAULT = "https://novac2c.cdn.weixin.qq.com/c2c"
-SESSION_FILE = os.path.join(STATE, "session.json")
-CURSOR_FILE = os.path.join(STATE, "cursor.txt")
-PROCESSED_FILE = os.path.join(STATE, "processed_ids.json")
-NEEDS_RELOGIN_FILE = os.path.join(STATE, "NEEDS_RELOGIN")
-LOGIN_PENDING_FILE = os.path.join(STATE, "login_pending.json")
-LOCK_FILE = os.path.join(STATE, "serve.lock")
+SESSION_FILE = _PATHS.session_file
+CURSOR_FILE = _PATHS.cursor_file
+PROCESSED_FILE = _PATHS.processed_file
+NEEDS_RELOGIN_FILE = _PATHS.needs_relogin_file
+LOGIN_PENDING_FILE = _PATHS.login_pending_file
+LOCK_FILE = _PATHS.lock_file
 import threading as _threading_top
 _SESSION_LOCK = _threading_top.RLock()
+# Gate 3 step 2: SQLite authority. The shadow module is imported
+# guarded: if it cannot be imported, serve still starts in json mode
+# (loud print + failure marker at refresh time). Shadow
+# unavailability must never equal bridge unavailability (design
+# section 3.1). The mode file itself is an OPERATOR action: no code
+# in this file ever writes it.
+try:
+    import bridge_sqlite as _SHADOW_MOD
+except Exception:
+    _SHADOW_MOD = None
 # Gemini R5: files whose post-send state write failed are halted in
 # memory for this process lifetime, never re-sent by the sender loop.
 _IN_MEMORY_HALTED_FILES = set()
@@ -176,7 +214,10 @@ def _is_terminal_job(job):
     # retries it instead of archiving it away.
     _plan = job.get('text_parts') if job.get('text_plan_version') == 1 and isinstance(job.get('text_parts'), list) else None
     if _plan is not None and job.get('text'):
-        _part_term = all(isinstance(p, dict) and p.get('status') in ('sent', 'failed', 'needs_check', 'blocked_by_prior') for p in _plan)
+        # Gate 1 item 1: 'skipped_empty' plan parts (widget-only
+        # parts sanitized away) are terminal like 'sent': they will
+        # never be sent, so they must not keep a job non-terminal.
+        _part_term = all(isinstance(p, dict) and p.get('status') in ('sent', 'failed', 'needs_check', 'blocked_by_prior', 'skipped_empty') for p in _plan)
         _atts = _terminal_attachments(job)
         _att_term = all(isinstance(a, dict) and a.get('status') in ('sent', 'failed', 'needs_check', 'blocked_by_prior') for a in _atts)
         _has_bad = any(isinstance(p, dict) and p.get('status') in ('failed', 'needs_check') for p in _plan) or any(
@@ -236,9 +277,11 @@ class PermanentError(ApiError):
 
 
 def ensure_dirs():
-    for d in (STATE, INBOX, RUNNING, DONE, OUTBOX_PENDING, OUTBOX_SENT,
-              OUTBOX_FAILED, MEDIA_INBOUND, MEDIA_OUTBOUND, FAILURES_DIR, ANALYSIS_DIR, LOCAL_VAULT_DIR):
-        os.makedirs(d, exist_ok=True)
+    # Gate 3 step 1: creation itself lives in bridge_storage, but the
+    # argument list is read from this module's globals at call time,
+    # so tests that rebind bridge.STATE etc. still redirect creation.
+    bridge_storage.ensure_dirs(STATE, INBOX, RUNNING, DONE, OUTBOX_PENDING, OUTBOX_SENT,
+                               OUTBOX_FAILED, MEDIA_INBOUND, MEDIA_OUTBOUND, FAILURES_DIR, ANALYSIS_DIR, LOCAL_VAULT_DIR)
 
 
 def load_image_event():
@@ -303,54 +346,11 @@ def _sanitize_error(e):
     return s
 
 
-def _atomic_tmp_path(path):
-    # Unique tmp name, so concurrent writers do not share one .tmp file.
-    return f"{path}.{os.getpid()}.tmp"
-
-
-def _open_private(path, mode):
-    # R4 fix: create the tmp file with the final mode from the first
-    # instant, instead of creating 0644 under umask 022 and chmodding
-    # only after replace. Use os.open with mode, then wrap in a file.
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-    return os.fdopen(fd, "w", encoding="utf-8")
-
-
-def atomic_write_json(path, obj, mode=0o600):
-    tmp = _atomic_tmp_path(path)
-    with _open_private(tmp, mode) as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except OSError:
-            pass
-    os.replace(tmp, path)
-    # Gemini R2: fsync parent dir so the rename itself is durable
-    try:
-        _dfd = os.open(os.path.dirname(os.path.abspath(path)) or ".", os.O_DIRECTORY)
-        try:
-            os.fsync(_dfd)
-        finally:
-            os.close(_dfd)
-    except Exception:
-        pass
-    try:
-        os.chmod(path, mode)
-    except OSError:
-        pass
-
-
-def atomic_write_text(path, text, mode=0o600):
-    tmp = _atomic_tmp_path(path)
-    with _open_private(tmp, mode) as f:
-        f.write(text)
-    os.replace(tmp, path)
-    try:
-        os.chmod(path, mode)
-    except OSError:
-        pass
+# Gate 3 step 1: _atomic_tmp_path, _open_private, atomic_write_json
+# and atomic_write_text now live in bridge_storage.py (imported at the
+# top of this file). bridge.atomic_write_json / bridge.atomic_write_text
+# remain available as module attributes via that import, so callers
+# and tests that reference them see no change.
 
 
 def _now_iso():
@@ -368,8 +368,8 @@ def _log_ts(msg):
     print(f"{_now_iso()} {msg}", flush=True)
 
 
-CHANNEL_STATUS_FILE = os.path.join(STATE, "channel_status.json")
-SERVE_RUN_FILE = os.path.join(STATE, "serve_run.json")
+CHANNEL_STATUS_FILE = _PATHS.channel_status_file
+SERVE_RUN_FILE = _PATHS.serve_run_file
 # v1.0.4 review fix (Finding 1): instance identity for the current
 # serve process. A new run_id is generated after flock succeeds, so
 # even a reused PID cannot make an old instance's success look like
@@ -540,6 +540,170 @@ def _record_channel_status(ok, error_text=None):
             "boot_id": _boot_id(),
             "proc_starttime": _proc_starttime(),
         }
+
+
+# Gate 2 -14 anomaly counting (篇三 Gate 2 item 3, 2026-11-01).
+# getupdates failures are bucketed into four fixed categories, with
+# counts + last-seen timestamps only. The file NEVER stores tokens,
+# URLs, user identifiers, message text, or raw error text: the
+# classifier below returns fixed enum strings only, and the record
+# function stores nothing else. The -14 behaviour is untouched:
+# check_ret still writes NEEDS_RELOGIN and serve_loop still exits
+# (return 14) without retrying. No probe experiment exists in this
+# code: a 300-second auto loop, a fixed five-minute self loop, and
+# any silent token swap are all explicitly out of scope (see
+# docs/getupdates-anomalies-manual.md for the gate that would have
+# to be met before a probe could even be considered).
+GETUPDATES_ANOMALY_CATEGORIES = ("login_expired", "network_error", "rate_limited", "result_unknown")
+GETUPDATES_ANOMALIES_SCHEMA = "getupdates-anomalies-0.1"
+_GETUPDATES_ANOMALY_DETAILS = {
+    "login_expired": ("ret_minus_14",),
+    "network_error": ("transport",),
+    "rate_limited": ("http_429", "rate_signal"),
+    "result_unknown": ("empty_or_nonjson", "http_error", "server_rejection", "unclassified"),
+}
+
+
+def _getupdates_anomalies_path():
+    # Computed at call time (not a module constant) so tests that
+    # rebind STATE, and any future STATE move, are honoured.
+    return os.path.join(STATE, "getupdates_anomalies.json")
+
+
+def classify_getupdates_error(exc):
+    """Classify a getupdates failure into (category, detail).
+
+    Both values are fixed enums. The exception text is only matched
+    against fixed patterns; it is never stored or returned. Order
+    matters: TokenExpired (-14) first; explicit throttling signals
+    before transport markers, because a transport wrapper message can
+    carry a stale empty-body note as its curl_err value; transport
+    markers before empty/non-JSON, because post_json wraps a failed
+    transport as "curl failed: ...; urllib failed: ..." even when the
+    curl half failed on an empty body. An explicit non-zero ret that
+    carries no rate-limit signal is NOT counted as rate limiting
+    (no numeric rate-limit code is assumed from upstream): it lands
+    in result_unknown with detail server_rejection, and the manual
+    tells the maintainer how to split it from the desensitised
+    channel_status last_error.
+    """
+    if isinstance(exc, TokenExpired):
+        return ("login_expired", "ret_minus_14")
+    s = str(exc)
+    low = s.lower()
+    if "http 429" in low:
+        return ("rate_limited", "http_429")
+    if any(p in low for p in ("rate limit", "rate_limit", "ratelimit", "too many requests", "too frequent")):
+        return ("rate_limited", "rate_signal")
+    if "curl failed:" in low:
+        return ("network_error", "transport")
+    if "empty response body" in low or "non-json response" in low or "empty or non-json" in low:
+        return ("result_unknown", "empty_or_nonjson")
+    if re.search(r"http \d{3}", low):
+        return ("result_unknown", "http_error")
+    if "ret=" in s:
+        return ("result_unknown", "server_rejection")
+    return ("result_unknown", "unclassified")
+
+
+def record_getupdates_anomaly(category, detail=None):
+    """Increment one getupdates anomaly bucket. Never raises.
+
+    Returns True when the counting file was written, False otherwise.
+    A write failure only leaves a desensitised failures marker
+    (kind + sanitised reason, no counts payload) and never blocks the
+    poll loop: callers ignore the return value.
+    """
+    if category not in GETUPDATES_ANOMALY_CATEGORIES:
+        category = "result_unknown"
+    allowed = _GETUPDATES_ANOMALY_DETAILS[category]
+    if detail not in allowed:
+        detail = "unclassified" if category == "result_unknown" else allowed[0]
+    try:
+        path = _getupdates_anomalies_path()
+        try:
+            os.makedirs(STATE, exist_ok=True)
+        except Exception:
+            pass
+        prev = {}
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    prev = json.load(f) or {}
+            except Exception:
+                prev = {}
+        if not isinstance(prev, dict):
+            prev = {}
+        counts = prev.get("counts")
+        if not isinstance(counts, dict):
+            counts = {}
+        last_seen = prev.get("last_seen")
+        if not isinstance(last_seen, dict):
+            last_seen = {}
+        last_detail = prev.get("last_detail")
+        if not isinstance(last_detail, dict):
+            last_detail = {}
+        clean_counts = {}
+        for c in GETUPDATES_ANOMALY_CATEGORIES:
+            v = counts.get(c)
+            clean_counts[c] = v if (isinstance(v, int) and not isinstance(v, bool) and v >= 0) else 0
+        clean_counts[category] += 1
+        clean_seen = {c: (last_seen.get(c) if isinstance(last_seen.get(c), str) else None) for c in GETUPDATES_ANOMALY_CATEGORIES}
+        clean_seen[category] = _now_iso()
+        clean_detail = {c: last_detail.get(c) for c in GETUPDATES_ANOMALY_CATEGORIES if last_detail.get(c) in _GETUPDATES_ANOMALY_DETAILS[c]}
+        clean_detail[category] = detail
+        atomic_write_json(path, {
+            "schema": GETUPDATES_ANOMALIES_SCHEMA,
+            "counts": clean_counts,
+            "last_seen": clean_seen,
+            "last_detail": clean_detail,
+        }, mode=0o600)
+        return True
+    except Exception as e:
+        try:
+            os.makedirs(FAILURES_DIR, exist_ok=True)
+            atomic_write_json(os.path.join(FAILURES_DIR, "getupdates_anomalies_write_failed.json"), {
+                "kind": "getupdates_anomalies_write_failed",
+                "reason": _sanitize_error(e),
+                "ts": _now_iso(),
+            }, mode=0o600)
+        except Exception:
+            pass
+        _safe_warn("serve: warning, getupdates anomaly count write failed (poll loop unaffected)")
+        return False
+
+
+def read_getupdates_anomalies():
+    """Read-only view of the anomaly counts. Never raises, never creates the file."""
+    zeros = {c: 0 for c in GETUPDATES_ANOMALY_CATEGORIES}
+    nones = {c: None for c in GETUPDATES_ANOMALY_CATEGORIES}
+    path = _getupdates_anomalies_path()
+    if not os.path.exists(path):
+        return {"schema": GETUPDATES_ANOMALIES_SCHEMA, "present": False, "readable": False, "counts": zeros, "last_seen": nones, "last_detail": {}}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f) or {}
+        if not isinstance(data, dict):
+            raise ValueError("anomalies file is not an object")
+        counts = data.get("counts")
+        if not isinstance(counts, dict):
+            raise ValueError("anomalies counts missing")
+        clean = {}
+        for c in GETUPDATES_ANOMALY_CATEGORIES:
+            v = counts.get(c)
+            clean[c] = v if (isinstance(v, int) and not isinstance(v, bool) and v >= 0) else 0
+        last_seen = data.get("last_seen")
+        clean_seen = {c: (last_seen.get(c) if isinstance(last_seen, dict) and isinstance(last_seen.get(c), str) else None) for c in GETUPDATES_ANOMALY_CATEGORIES}
+        last_detail = data.get("last_detail")
+        clean_detail = {c: last_detail.get(c) for c in GETUPDATES_ANOMALY_CATEGORIES if isinstance(last_detail, dict) and last_detail.get(c) in _GETUPDATES_ANOMALY_DETAILS[c]}
+        return {"schema": GETUPDATES_ANOMALIES_SCHEMA, "present": True, "readable": True, "counts": clean, "last_seen": clean_seen, "last_detail": clean_detail}
+    except Exception:
+        return {"schema": GETUPDATES_ANOMALIES_SCHEMA, "present": True, "readable": False, "counts": zeros, "last_seen": nones, "last_detail": {}}
+
+
+def cmd_getupdates_anomalies(_args):
+    print(json.dumps(read_getupdates_anomalies(), ensure_ascii=False, indent=2))
+    return 0
 
 
 def load_session():
@@ -1168,7 +1332,7 @@ def send_typing(session, ticket, status, to_user_id=None, context_token=None):
 def send_direct_or_outbox(session, text, to_user_id, context_token, outbox_name):
     """Gemini R8 fix: QUEUE ONLY, no network send. The sender thread
     is the sole network sender. Main-thread fast replies (/ping,
-    queue notice, voice prompt, image-fail prompt) are written to
+    voice prompt, image-fail prompt) are written to
     outbox/pending and sent by _sender_loop within ~1s, instead of
     competing with drain_outbox for the network interface.
     Returns True if queued (not sent), False if queue write failed.
@@ -1180,6 +1344,15 @@ def send_direct_or_outbox(session, text, to_user_id, context_token, outbox_name)
     try:
         with _OUTBOX_LOCK:
             atomic_write_json(os.path.join(OUTBOX_PENDING, outbox_name), job, mode=0o600)
+        # Gate 1 item 2: bridge-written jobs record their own
+        # queued moment exactly; Worker-written jobs are first
+        # seen by drain_outbox instead (see there).
+        record_timeline_event(outbox_name, "queued", source="bridge_write")
+        # Gate 3 step 2: shadow job mirror for bridge-written tasks
+        # (tracked names only; _progress/_offline/_queue receipts
+        # are auxiliary and intentionally untracked, mirroring the
+        # json_snapshot exclusion).
+        _shadow_upsert_job_ready(outbox_name, job)
         return True
     except Exception as e2:
         print(f"outbox queue failed for {outbox_name}: {e2}", flush=True)
@@ -1287,37 +1460,33 @@ def image_format_from_magic(data):
 
 
 def aes_ecb_encrypt(plaintext, key):
-    """AES-128-ECB with PKCS#7 padding via system openssl (no salt)."""
-    if not shutil.which("openssl"):
-        raise ApiError("openssl not available for AES-ECB")
-    cmd = ["openssl", "enc", "-aes-128-ecb", "-e", "-K", key.hex(), "-nosalt"]
+    """AES-128-ECB with PKCS#7 padding, in-process (Gate 2 switch).
+
+    Public contract unchanged: returns ciphertext bytes, raises ApiError
+    on any strict failure (bad key/plaintext). No subprocess is spawned,
+    so there is no 30-second subprocess timeout anymore and no key hex
+    in any command-line argv; the only bound is the caller's plaintext
+    size cap. In-process errors (ValueError/TypeError) are translated
+    to ApiError here so every existing caller keeps its exact behavior
+    (decrypt callers map any exception to DECRYPT_FAILED; send callers
+    propagate ApiError as a strict failure)."""
     try:
-        r = subprocess.run(cmd, input=plaintext, capture_output=True, timeout=30)
-    except subprocess.TimeoutExpired:
-        # v1.0.1: TimeoutExpired str() contains the full argv incl. -K hex.
-        # Never let that exception object escape; raise a key-free ApiError.
-        # v1.0.3: from None cuts the __context__ chain, so a traceback
-        # can never print the original TimeoutExpired argv.
-        raise ApiError("openssl encrypt timeout") from None
-    if r.returncode != 0:
-        raise ApiError(f"openssl encrypt failed: {r.stderr[:200]!r}")
-    return r.stdout
+        return aes_inprocess_encrypt(plaintext, key)
+    except (ValueError, TypeError):
+        raise ApiError("in-process AES encrypt failed (bad key/plaintext)") from None
 
 
 def aes_ecb_decrypt(ciphertext, key):
-    """AES-128-ECB decrypt, strict PKCS#7 padding via openssl.
-    Non-zero exit = padding/decrypt failure; caller must NOT save
-    the ciphertext as plaintext in that case."""
-    if not shutil.which("openssl"):
-        raise ApiError("openssl not available for AES-ECB")
-    cmd = ["openssl", "enc", "-aes-128-ecb", "-d", "-K", key.hex(), "-nosalt"]
+    """AES-128-ECB decrypt, strict PKCS#7 padding, in-process (Gate 2).
+
+    Public contract unchanged: returns plaintext bytes, raises ApiError
+    on padding/decrypt failure; caller must NOT save the ciphertext
+    as plaintext in that case. No subprocess, no subprocess timeout,
+    no key hex in any argv."""
     try:
-        r = subprocess.run(cmd, input=ciphertext, capture_output=True, timeout=30)
-    except subprocess.TimeoutExpired:
-        raise ApiError("openssl decrypt timeout") from None
-    if r.returncode != 0:
-        raise ApiError(f"openssl decrypt failed (bad padding/key): {r.stderr[:200]!r}")
-    return r.stdout
+        return aes_inprocess_decrypt(ciphertext, key)
+    except (ValueError, TypeError):
+        raise ApiError("in-process AES decrypt failed (bad padding/key)") from None
 
 
 def download_bytes_diag(url, timeout=15):
@@ -1326,7 +1495,7 @@ def download_bytes_diag(url, timeout=15):
     or the body, only status/headers sizes/class/sha.
     Counting points (ChatGPT 2026-10-28 download-integrity fix):
     - http_read: length/sha at HTTP read completion (count 1)
-    - pre_decrypt: length/sha just before OpenSSL (count 2, in caller)
+    - pre_decrypt: length/sha just before in-process decrypt (count 2, in caller)
     - saved_file: length/sha after failure download.bin is written
       (count 3, in write_failure_record caller check)
     All three must be identical for the same decoded binary.
@@ -1945,6 +2114,96 @@ def process_inbound_file(file_item, message_id, item_index, deadline_ts, plain_b
     return saved, None, diag
 
 
+# ---------------------------------------------------------------- doc-parse
+# wiring (Gate 3 item 2): auto-parse a landed file right after receipt.
+# The parser runs under the serve interpreter (system python3); the M0
+# venv lacks python-docx/openpyxl and must never be used here. The
+# parser's own fuse (--timeout) is the operative bound; the caller
+# timeout below is only a kill-switch so a wedged launcher cannot
+# stall the loop past the same bound. Parse failures never touch
+# receipt: they leave a failure evidence file and the message still
+# reaches the Worker.
+DOC_PARSE_TIMEOUT_SECONDS = 55
+DOC_PARSE_CALLER_TIMEOUT_SECONDS = 60
+
+
+def doc_evidence_path_for(saved_path, item_index):
+    """Sibling evidence name, fixed by contract: doc_evidence_<idx>.json
+    next to the landed file. The Worker finds it by this name; the
+    inbox record is never mutated for it (no race with Worker pickup)."""
+    return os.path.join(os.path.dirname(saved_path),
+                        "doc_evidence_%s.json" % item_index)
+
+
+def _write_doc_parse_failure_evidence(evidence_path, code, reason):
+    """Minimal failure evidence, atomic 0600. Never raises."""
+    try:
+        atomic_write_json(evidence_path, {
+            "schema_version": "doc-evidence-0.1",
+            "source": {"file_name": None, "sha256": None,
+                       "size_bytes": None, "format": None},
+            "status": "failed",
+            "failure_code": code,
+            "failure_reason": reason,
+            "anchors": [],
+            "notes": {"wiring_synthesized": True},
+            "peak_rss_kib": None,
+            "scratch_dir": None,
+            "scratch_cleanup": None,
+        }, mode=0o600)
+    except Exception:
+        pass
+
+
+def maybe_parse_inbound_doc(saved, item_index):
+    """Auto-parse one landed file. Never raises. Returns 'parsed',
+    'failed', or 'skipped_exists'. Only called on the ordinary file
+    path: the local-only refusal branch returns before any download,
+    so it can never reach here. Receipt reuse flows through here too:
+    a reused save still lands an evidence file unless one exists."""
+    try:
+        path = saved.get("path") if isinstance(saved, dict) else None
+        if not path or not os.path.isfile(path):
+            return "failed"
+        evidence_path = doc_evidence_path_for(path, item_index)
+        if os.path.exists(evidence_path):
+            return "skipped_exists"
+        parser = os.path.join(ROOT, "analyzer", "doc_parser.py")
+        if not os.path.isfile(parser):
+            _write_doc_parse_failure_evidence(
+                evidence_path, "wiring_failed", "doc_parser.py missing")
+            return "failed"
+        cmd = [sys.executable, parser, path, evidence_path,
+               "--timeout", str(DOC_PARSE_TIMEOUT_SECONDS)]
+        try:
+            proc = subprocess.run(cmd, capture_output=True,
+                                  timeout=DOC_PARSE_CALLER_TIMEOUT_SECONDS,
+                                  stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            _write_doc_parse_failure_evidence(
+                evidence_path, "caller_timeout",
+                "doc_parser launcher did not return in time")
+            return "failed"
+        except Exception:
+            _write_doc_parse_failure_evidence(
+                evidence_path, "wiring_failed", "doc_parser launch failed")
+            return "failed"
+        if proc.returncode != 0 or not os.path.isfile(evidence_path):
+            if not os.path.isfile(evidence_path):
+                _write_doc_parse_failure_evidence(
+                    evidence_path, "wiring_failed",
+                    "doc_parser exited without evidence")
+            return "failed"
+        try:
+            with open(evidence_path, encoding="utf-8") as f:
+                status = json.load(f).get("status")
+        except Exception:
+            status = None
+        return "parsed" if status == "completed" else "failed"
+    except Exception:
+        return "failed"
+
+
 def send_video(session, video_path, to_user_id, context_token, client_id=None):
     """Practical video send v1: getuploadurl (media_type=2) -> upload
     ciphertext -> sendmessage type=5. Mirrors send_image, except:
@@ -2271,20 +2530,21 @@ def _detect_magic(b):
 
 
 def _raw_aes128_ecb_decrypt_block(key, block16):
-    """Diagnostic only: decrypt ONE 16-byte block with -nopad.
+    """Diagnostic only: decrypt ONE 16-byte block, no unpadding.
     Never used for formal decrypt, never outputs plaintext or key.
-    Returns 16 bytes or None."""
-    if not shutil.which("openssl") or len(key) != 16 or len(block16) != 16:
+    Returns 16 bytes or None. Gate 2: in-process (was openssl -nopad),
+    so key bytes never appear in a subprocess argv anymore."""
+    if not isinstance(key, (bytes, bytearray)) or len(key) != 16:
+        return None
+    if not isinstance(block16, (bytes, bytearray)) or len(block16) != 16:
         return None
     try:
-        r = subprocess.run(["openssl", "enc", "-aes-128-ecb", "-d",
-                            "-K", key.hex(), "-nosalt", "-nopad"],
-                           input=block16, capture_output=True, timeout=10)
-        if r.returncode != 0 or len(r.stdout) != 16:
-            return None
-        return r.stdout
+        out = aes_inprocess_decrypt_nopad(bytes(block16), bytes(key))
     except Exception:
         return None
+    if len(out) != 16:
+        return None
+    return out
 
 
 def build_safe_cipher_diagnostics(attempt1_bytes, attempt2_bytes, key_bytes):
@@ -2968,7 +3228,7 @@ def save_pending_local_queries(items):
 
 
 DEFAULT_ANALYZER_PY = "/home/hatch/workspace/goals/muse-wechat-bridge/hidden_files/m0-component/venv/bin/python"
-ANALYZER_RUNS_FILE = os.path.join(STATE, "analyzer_runs.json")
+ANALYZER_RUNS_FILE = _PATHS.analyzer_runs_file
 
 
 def _resolve_candidate(candidate):
@@ -3248,11 +3508,11 @@ def move_videos_to_local_vault(message_id, saved_videos):
 
 
 def _load_json_dict(path):
-    try:
-        data = json.load(open(path, encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    # Gate 3 step 1: safe dict read lives in bridge_storage.py.
+    # Observable behavior is unchanged (parsed dict, else {} on any
+    # failure); the only difference is the file handle is now closed
+    # instead of leaked.
+    return bridge_storage.read_json_dict(path)
 
 
 def _save_json_dict_atomic(path, data):
@@ -3429,7 +3689,7 @@ def parse_local_keep(text):
     return (m.group(1), int(m.group(2))) if m else None
 
 
-SAFE_VIEW_FILE = os.path.join(STATE, "safe_history_view.json")
+SAFE_VIEW_FILE = _PATHS.safe_view_file
 SAFE_VIEW_VERSION = "safe-view-v1"
 SAFE_VIEW_MAX_ROUNDS = 10
 
@@ -4013,6 +4273,13 @@ def recover_sending_on_startup():
                 job = json.load(f)
         except Exception:
             continue
+        if not isinstance(job, dict):
+            # Gate 1 remainder: shape guard lives in drain_outbox;
+            # startup recovery only skips a non-object file (drain
+            # parks it on the next tick) instead of dying on the
+            # first job.get() below.
+            print(f"outbox: skipping non-object job {name} in startup recovery (drain will park it)", flush=True)
+            continue
         _plan_rec = _text_plan(job)
         _plan_sending = bool(_plan_rec and any(
             isinstance(p, dict) and p.get("status") == "sending" for p in _plan_rec))
@@ -4050,9 +4317,16 @@ def recover_sending_on_startup():
                 atomic_write_json(path, job, mode=0o600)
                 os.replace(path, os.path.join(OUTBOX_FAILED, name))
                 print(f"outbox: recovered sending {name} -> failed/ needs_check (restart)", flush=True)
+                # Gate 3 step 2: shadow sync AFTER the JSON lock
+                # (design 1.2 startup row order). Fail-open.
+                _shadow_mirror_terminal(name, job, "needs_check", "send_restart_unknown")
             except Exception as e:
                 _TERMINAL_TASK_IDS.add(name)
                 print(f"outbox: recovery failed for {name}: {_sanitize_error(e)}; marked terminal, will NOT resend", flush=True)
+            # Gate 1 item 2: a crash-mid-send job is result-unknown
+            # and must be checked by hand, never auto-resent.
+            record_timeline_event(name, "needs_check", failure_code="send_restart_unknown",
+                                  source="startup_recovery")
 
 
 def _classify_delivery_error(e):
@@ -4101,6 +4375,2276 @@ def _scrub_job_token(path, job):
         return False
 
 
+def _sha256_file(path):
+    """Return the hex SHA-256 of a file, or None if it cannot be read.
+
+    Never raises: a missing or unreadable evidence file is an audit
+    fact (null hash), not a reason to break sending."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def write_evidence_audit(job_id, reply_text):
+    """Append one bridge-side evidence audit record, or nothing.
+
+    Bridge-side observation only, and the docstring must stay honest
+    about it: this record proves that, at the moment a reply reached
+    the sent terminal state, an analysis evidence file existed (or
+    did not), what run state it reported, and what its hash was. It
+    does NOT prove that the Worker actually read that evidence:
+    Worker reading happens outside this bridge code and is not
+    observable from here. A record that says evidence_before_reply
+    is true must never be read as "the Worker read the evidence".
+
+    Rules (item: evidence audit, 2026-10-31):
+    - Only replies that correspond to a video message are audited:
+      the done record has a non-empty videos list and is not
+      local_only, or an analysis/<message_id>_* directory exists.
+      Anything else returns False without writing.
+    - Local-only video replies are never audited: a local-only
+      reply is a generic sentence, not an analysis reply, and its
+      done record carries local_only=True.
+    - Per analysis directory, state.json is read best-effort:
+      missing or unparsable state.json gives state_status
+      "unknown", never an exception.
+    - Only hashes and lengths are recorded, never reply text,
+      evidence text, or any token.
+    - An audit write failure must never break sending: it is
+      recorded in failures/ (field names and error type only) and
+      this function returns False.
+
+    Returns True when an audit line was appended, False otherwise
+    (not a video reply, local-only, or any failure). Never raises.
+    """
+    try:
+        message_id = str(job_id)
+        if message_id.endswith(".json"):
+            message_id = message_id[:-5]
+        # Local-only replies are generic sentences, not analysis
+        # replies: skip them even if an analysis directory were
+        # somehow present.
+        try:
+            with open(os.path.join(DONE, "%s.json" % message_id), encoding="utf-8") as f:
+                done = json.load(f)
+        except Exception:
+            done = None
+        if isinstance(done, dict) and done.get("local_only") is True:
+            return False
+        has_videos = isinstance(done, dict) and bool(done.get("videos"))
+        try:
+            dirs = sorted(
+                d for d in os.listdir(ANALYSIS_DIR)
+                if d.startswith("%s_" % message_id)
+                and os.path.isdir(os.path.join(ANALYSIS_DIR, d)))
+        except Exception:
+            dirs = []
+        if not has_videos and not dirs:
+            return False
+        evidence_dirs = []
+        evidence_before_reply = False
+        for d in dirs:
+            outdir = os.path.join(ANALYSIS_DIR, d)
+            state_status = "unknown"
+            try:
+                with open(os.path.join(outdir, "state.json"), encoding="utf-8") as f:
+                    state_doc = json.load(f)
+                if isinstance(state_doc, dict) and isinstance(state_doc.get("state"), str):
+                    state_status = state_doc["state"]
+            except Exception:
+                state_status = "unknown"
+            evidence_path = os.path.join(outdir, "evidence.json")
+            evidence_sha = _sha256_file(evidence_path) if os.path.exists(evidence_path) else None
+            narrative_sha = _sha256_file(os.path.join(outdir, "narrative.md"))
+            if state_status in ("completed", "partial") and evidence_sha is not None:
+                evidence_before_reply = True
+            evidence_dirs.append({
+                "dir": d,
+                "state_status": state_status,
+                "evidence_sha256": evidence_sha,
+                "narrative_sha256": narrative_sha,
+            })
+        text = reply_text if isinstance(reply_text, str) else ""
+        record = {
+            "schema": "evidence-audit-0.1",
+            "message_id": message_id,
+            "sent_at_wall": _now_iso(),
+            "evidence_before_reply": evidence_before_reply,
+            "evidence_dirs": evidence_dirs,
+            "reply_text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "reply_text_len": len(text),
+        }
+        audit_path = os.path.join(STATE, "evidence_audit.jsonl")
+        try:
+            os.makedirs(STATE, exist_ok=True)
+            with open(audit_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            try:
+                os.chmod(audit_path, 0o600)
+            except OSError:
+                pass
+        except Exception as e:
+            try:
+                write_failure_record(
+                    message_id, "evidence_audit",
+                    {"kind": "evidence_audit_failed",
+                     "error_type": type(e).__name__},
+                )
+            except Exception:
+                pass
+            return False
+        return True
+    except Exception:
+        # Audit must never break sending, whatever went wrong above.
+        return False
+
+
+# Gate 1 item 1 (2026-10-31): outbound sanitize.
+#
+# sanitize_outbound_text() removes Muse internal widget tags
+# [[hatch_widget:...]] from text that is about to be sent to WeChat,
+# while leaving normal Markdown, quotes and code-fence contents
+# untouched. Rules, in order:
+# - A tag starts with the literal prefix "[[hatch_widget:" and ends
+#   at the matching "]]". Bracket depth is tracked, so a single "]"
+#   inside a tag does not end it, and a nested "[[" inside a tag
+#   is consumed as part of that tag. If no matching "]]" is ever
+#   found, the tag is left verbatim: when in doubt, keep text, do
+#   not delete user prose (conservative, per the task definition).
+# - Fenced code blocks are literal: lines inside a fenced block
+#   (tracked with the same _fence_match/_update_fence helpers used
+#   by long-text segmentation) are returned unchanged, so a widget
+#   tag a user pasted as code text is preserved, not stripped.
+# - Nothing else is changed: no whitespace normalisation, no
+#   Markdown rewriting, no family-phrasing rewrite (there is no
+#   family-mode switch in this bridge, so no such rewrite exists
+#   here; inventing a default-on rewrite would change wording
+#   the operator never asked for).
+# - Emptiness is judged by the caller on the sanitized text with
+#   .strip(): a text that is only widget tags, whitespace and
+#   blank lines sanitizes to whitespace-only and must never be
+#   sent as a blank bubble (see drain_outbox).
+_WIDGET_PREFIX = "[[hatch_widget:"
+
+
+def _strip_widget_tags(s):
+    """Remove [[hatch_widget:...]] tags from one plain-text string.
+
+    Depth-tracked: "]]" only closes a tag when bracket depth
+    returns to zero, so single "]" characters inside a tag are
+    harmless, and nested "[[" inside a tag is consumed with it.
+    An unclosed tag is left verbatim (conservative: never delete
+    prose on a guess)."""
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        if s.startswith(_WIDGET_PREFIX, i):
+            depth = 1
+            j = i + 2
+            closed = None
+            while j < n:
+                if s.startswith("[[", j):
+                    depth += 1
+                    j += 2
+                elif s.startswith("]]", j):
+                    depth -= 1
+                    j += 2
+                    if depth == 0:
+                        closed = j
+                        break
+                else:
+                    j += 1
+            if closed is not None:
+                i = closed
+                continue
+            out.append(s[i:])
+            break
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def sanitize_outbound_text(text):
+    """Strip widget tags outside fenced code blocks, nothing else.
+
+    Returns "" for non-string input. Fence state is tracked line
+    by line with _fence_match/_update_fence on the original lines,
+    so an unclosed fence keeps the rest of the text literal, and
+    a fence delimiter line itself is never treated as content."""
+    if not isinstance(text, str):
+        return ""
+    out = []
+    fence = None
+    for line in _split_keepends_nl(text):
+        if fence is None:
+            out.append(_strip_widget_tags(line))
+        else:
+            out.append(line)
+        fence = _update_fence(fence, line)
+    return "".join(out)
+
+
+def _sanitized_part_is_empty(display_text):
+    """True when a sanitized plan part carries no sendable content.
+
+    The caller passes the already-sanitized display_text. The
+    "[i/N]" label line and any fence delimiter lines are not
+    content, so they are dropped before the emptiness check; what
+    remains (including any widget-like text preserved inside a
+    fenced block) decides. A part that is only a label, only
+    fence lines, or only whitespace is empty."""
+    if not isinstance(display_text, str):
+        return True
+    lines = display_text.splitlines()
+    if lines and re.match(r"^\[\d+/\d+\]$", lines[0].strip()):
+        lines = lines[1:]
+    while lines and _fence_match(lines[0]) is not None:
+        lines = lines[1:]
+    while lines and _fence_match(lines[-1]) is not None:
+        lines = lines[:-1]
+    return "".join(lines).strip() == ""
+
+
+# Gate 1 item 2 (2026-11-01): observability.
+#
+# One message's journey (received -> queued -> sent/failed) is made
+# checkable from the bridge side, instead of guessable from log
+# lines. Rules, in order:
+# - Events are appended to state/message_timeline.jsonl (0600), one
+#   JSON object per line: schema, job (outbox filename without
+#   ".json"), stage, UTC ISO timestamp, source, and, for terminal
+#   events, a stable failure code plus a short fixed reason. No
+#   reply text, no attachment content, no token, no user id, no
+#   recipient id is ever written here: the job filename is the
+#   only identifier, and it is already the outbox filename.
+# - Timestamps are UTC ISO with seconds
+#   (e.g. 2026-11-01T03:00:00+00:00), so they sort
+#   lexicographically. The older _now_iso() uses local time and
+#   is kept for serve.log lines only; it is NOT used here.
+# - A missing stage is missing: the reader returns None for it,
+#   never a fabricated time. In particular, "worker_started" is
+#   part of the schema but is NEVER emitted by bridge code: the
+#   Worker runs outside this bridge, and there is no bridge-side
+#   signal for the moment it starts. The queue notice is written
+#   by the bridge itself and must never be read as Worker start
+#   (serve_loop already warns about exactly this). Filling
+#   worker_started needs a Worker-side marker, which does not
+#   exist here; until then it stays not_observed.
+# - "queued" has two honest sources. Bridge-written jobs
+#   (send_direct_or_outbox: fast replies, local replies; queue
+#   notices were removed by the 2026-11-01 waiting-prompt merge,
+#   old ones on disk keep their bridge_write times) record it
+#   at the write, source "bridge_write".
+#   Worker-written jobs (<message_id>.json) are written outside
+#   this code, so the bridge cannot timestamp that write; drain
+#   records the first sighting instead, source
+#   "drain_first_seen", which is an upper bound on the queue
+#   time, not the write time. The reader takes the earliest
+#   event per stage, so a bridge_write time always wins over a
+#   later first-sighting.
+# - Timeline writes never block sending: record_timeline_event
+#   never raises, and every call site treats a False return as
+#   "no observability record", never as a send failure.
+# - Failure codes are a fixed, enumerable set (see
+#   _OBS_FAILURE_REASONS); they are derived from job fields and
+#   part error codes, never from exception text or message text.
+_OBS_TIMELINE_SCHEMA = "message-timeline-0.1"
+_OBS_STAGES = ("received", "queued", "worker_started", "sent",
+               "failed", "needs_check", "skipped_empty", "progress",
+               "offline_receipt")
+_OBS_FAILURE_REASONS = {
+    "send_permanent": "permanent delivery failure",
+    "send_retryable": "retryable failure, attempts remain",
+    "send_retry_limit": "retry limit reached",
+    "send_unknown": "delivery result unknown",
+    "send_restart_unknown": "serve restarted with item in sending state",
+    "recipient_mismatch": "recipient does not match bound account",
+    "recipient_missing": "recipient missing and no local receipt record",
+    "job_not_object": "pending job is not a JSON object",
+    "text_plan_mismatch": "long-text plan does not match text",
+    "text_part_failed_or_unknown": "long-text part failed or unknown",
+    "text_too_long": "text exceeds segment limit",
+    "unknown_attachment_type": "unknown attachment type",
+    "skipped_empty": "sanitized text is empty",
+    "delivery_failed": "delivery failed",
+    "delivery_unknown": "delivery result unknown",
+}
+_OBS_PART_CODE_MAP = {
+    "retry_limit": "send_retry_limit",
+    "retryable": "send_retryable",
+    "permanent": "send_permanent",
+    "unknown_delivery": "send_unknown",
+    "restart_unknown": "send_restart_unknown",
+}
+# Process-lifetime dedup for drain first-sighting of queued jobs.
+# The reader takes the earliest event per stage, so a re-record
+# after a serve restart cannot corrupt the view.
+_OBS_QUEUED_SEEN = set()
+
+
+def _now_utc_iso():
+    """UTC ISO timestamp with seconds, lexicographically sortable."""
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def _obs_job_key(name):
+    """Outbox filename -> timeline job key, or None if unsafe.
+
+    Only a bare filename is accepted (no separators, no empty,
+    no dot-files): a crafted name must never turn into a path
+    outside the timeline file."""
+    if not isinstance(name, str):
+        return None
+    if name.endswith(".json"):
+        name = name[:-5]
+    if not name or name.startswith("."):
+        return None
+    if "/" in name or "\\" in name:
+        return None
+    return name
+
+
+def record_timeline_event(job_name, stage, failure_code=None, source=None):
+    """Append one observability event. Never raises, never blocks.
+
+    Returns True when the line was appended, False otherwise
+    (bad stage, unsafe job key, or any write failure). The caller
+    must never treat False as a send failure."""
+    try:
+        key = _obs_job_key(job_name)
+        if key is None or stage not in _OBS_STAGES:
+            return False
+        if failure_code is not None and failure_code not in _OBS_FAILURE_REASONS:
+            return False
+        record = {
+            "schema": _OBS_TIMELINE_SCHEMA,
+            "job": key,
+            "stage": stage,
+            "ts": _now_utc_iso(),
+            "source": source or "bridge",
+        }
+        if failure_code is not None:
+            record["failure_code"] = failure_code
+            record["reason"] = _OBS_FAILURE_REASONS[failure_code]
+        os.makedirs(STATE, exist_ok=True)
+        path = os.path.join(STATE, "message_timeline.jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _obs_failure_code_for_job(job):
+    """Stable failure code for a terminal job, or None.
+
+    Preference order: explicit needs_check_reason, then the first
+    bad long-text part's error code, then attachment errors, then
+    the legacy text error. Unknown shapes fall back to the generic
+    delivery_failed / delivery_unknown codes, never to exception
+    text or message text."""
+    if not isinstance(job, dict):
+        return None
+    if job.get("delivery_state") == "unknown_restart":
+        return "send_restart_unknown"
+    _reason = job.get("needs_check_reason")
+    if _reason == "recipient_mismatch":
+        return "recipient_mismatch"
+    if _reason == "recipient_missing":
+        return "recipient_missing"
+    if _reason == "job_not_object":
+        return "job_not_object"
+    if _reason == "text_plan_mismatch":
+        return "text_plan_mismatch"
+    # Any other needs_check_reason (including the generic
+    # text_part_failed_or_unknown and the startup-recovery
+    # sentences) falls through to the derivation below, so a
+    # precise stored code wins over a generic reason.
+    _tcode = job.get("text_error_code")
+    if isinstance(_tcode, str) and _tcode in _OBS_FAILURE_REASONS:
+        return _tcode
+    _plan = _text_plan(job)
+    if _plan is not None:
+        for _p in _plan:
+            if not isinstance(_p, dict):
+                continue
+            if _p.get("status") in ("failed", "needs_check"):
+                _mapped = _OBS_PART_CODE_MAP.get(_p.get("error_code"))
+                if _mapped is not None:
+                    return _mapped
+                return "delivery_failed" if _p.get("status") == "failed" else "delivery_unknown"
+    for _att in _terminal_attachments(job):
+        if not isinstance(_att, dict):
+            continue
+        if _att.get("status") in ("failed", "needs_check"):
+            _err = _att.get("error") or ""
+            if isinstance(_err, str) and "unknown attachment type" in _err:
+                return "unknown_attachment_type"
+            _acode = _att.get("error_code")
+            if isinstance(_acode, str) and _acode in _OBS_FAILURE_REASONS:
+                return _acode
+            return "delivery_failed" if _att.get("status") == "failed" else "delivery_unknown"
+    if job.get("text_status") == "failed":
+        _terr = job.get("text_error") or ""
+        if isinstance(_terr, str) and "too long" in _terr:
+            return "text_too_long"
+        return "delivery_failed"
+    if job.get("text_status") == "needs_check":
+        return "delivery_unknown"
+    if job.get("delivery_state") == "failed":
+        return "delivery_failed"
+    if job.get("delivery_state") == "needs_check":
+        return "delivery_unknown"
+    return None
+
+
+def read_message_timeline(job_name):
+    """All timeline events for one job, earliest first. Never raises.
+
+    Returns [] when the timeline file is missing, unreadable, or
+    the job has no events. Events are returned as stored (schema,
+    job, stage, ts, source, and terminal failure_code/reason
+    only); no text or token ever appears in them."""
+    key = _obs_job_key(job_name)
+    if key is None:
+        return []
+    try:
+        path = os.path.join(STATE, "message_timeline.jsonl")
+        events = []
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(ev, dict) and ev.get("job") == key:
+                    events.append(ev)
+        return events
+    except Exception:
+        return []
+
+
+def _obs_job_outcome(job):
+    """Outcome bucket for one job dict (no file access).
+
+    needs_check and skipped_empty are separate buckets, never
+    folded into failed or sent: a skipped text with sent
+    attachments still reports text_skipped, and a needs_check job
+    is never counted as failed."""
+    if not isinstance(job, dict):
+        return "unknown", False
+    _skipped = job.get("delivery_state") == "skipped_empty" or job.get("text_status") == "skipped_empty"
+    # Bucket order is deliberate and shared by the per-message view
+    # and the summary: needs_check first, then failed, then
+    # skipped_empty (a job whose text was skipped AND whose
+    # attachment failed is a failure first, with text_skipped
+    # noted alongside), then sent, then pending.
+    if job.get("delivery_state") in ("needs_check", "unknown_restart") or job.get("needs_check_reason"):
+        return "needs_check", _skipped
+    _plan = _text_plan(job)
+    if _plan is not None:
+        if any(isinstance(p, dict) and p.get("status") == "needs_check" for p in _plan):
+            return "needs_check", _skipped
+        if any(isinstance(p, dict) and p.get("status") == "failed" for p in _plan):
+            return "failed", _skipped
+    if any(isinstance(a, dict) and a.get("status") == "needs_check" for a in _terminal_attachments(job)):
+        return "needs_check", _skipped
+    if any(isinstance(a, dict) and a.get("status") == "failed" for a in _terminal_attachments(job)):
+        return "failed", _skipped
+    if job.get("text_status") == "needs_check":
+        return "needs_check", _skipped
+    if job.get("text_status") == "failed":
+        return "failed", _skipped
+    if job.get("delivery_state") == "failed":
+        return "failed", _skipped
+    if _skipped:
+        return "skipped_empty", True
+    if job.get("delivery_state") == "sent":
+        return "sent", _skipped
+    return "pending", _skipped
+
+
+def get_message_observability(job_name):
+    """Per-message observability view. Read-only, never raises.
+
+    Stages are the earliest timeline timestamp per stage, or None
+    when the stage was never observed (never a fabricated time).
+    worker_started is always None here: no bridge-side signal
+    exists for it (see the module note above). Outcome comes
+    from the job file's location and status, not from the
+    timeline, so a missing timeline line cannot fake a sent job.
+    failure_codes lists the terminal event's code (if any) plus
+    the job-derived code (if any), deduplicated. analysis_states
+    lists only directory names and analyzer state strings for a
+    bare message-id job, never analysis content."""
+    key = _obs_job_key(job_name)
+    view = {
+        "schema": "message-observability-0.1",
+        "job": key,
+        "stages": {"received": None, "queued": None,
+                   "worker_started": None, "sent": None},
+        "stage_notes": {
+            "worker_started": "not_observed_by_bridge",
+        },
+        "outcome": "unknown",
+        "text_skipped": False,
+        "failure_codes": [],
+        "analysis_states": [],
+        "event_count": 0,
+        # Gate 1 item 3: earliest progress-receipt moment, or None.
+        # Kept out of "stages" on purpose: the item-2 view contract
+        # (stages is exactly received/queued/worker_started/sent)
+        # stays intact, and a progress receipt is not a sent
+        # formal reply, so it must never appear as stages.sent.
+        "progress_at": None,
+        # Gate 1 item 4: earliest offline-receipt moment, or None.
+        # Same reason as progress_at: an offline receipt is not
+        # a formal reply and must never appear as stages.sent.
+        "offline_receipt_at": None,
+    }
+    if key is None:
+        return view
+    events = read_message_timeline(key)
+    view["event_count"] = len(events)
+    _earliest = {}
+    _terminal_code = None
+    for ev in events:
+        _st = ev.get("stage")
+        _ts = ev.get("ts")
+        if _st in ("received", "queued", "sent") and isinstance(_ts, str):
+            if _st not in _earliest or _ts < _earliest[_st]:
+                _earliest[_st] = _ts
+        if _st == "progress" and isinstance(_ts, str):
+            if view["progress_at"] is None or _ts < view["progress_at"]:
+                view["progress_at"] = _ts
+        if _st == "offline_receipt" and isinstance(_ts, str):
+            if view["offline_receipt_at"] is None or _ts < view["offline_receipt_at"]:
+                view["offline_receipt_at"] = _ts
+        if _st in ("failed", "needs_check", "skipped_empty") and _terminal_code is None:
+            if isinstance(ev.get("failure_code"), str):
+                _terminal_code = ev["failure_code"]
+    view["stages"].update(_earliest)
+    job = None
+    _found_dir = None
+    for _d, _label in ((OUTBOX_SENT, "sent"), (OUTBOX_FAILED, "failed"),
+                       (OUTBOX_PENDING, "pending")):
+        try:
+            _p = os.path.join(_d, "%s.json" % key)
+            if os.path.exists(_p):
+                with open(_p, encoding="utf-8") as f:
+                    job = json.load(f)
+                _found_dir = _label
+                break
+        except Exception:
+            job = None
+            _found_dir = None
+            break
+    if job is not None and _found_dir == "sent":
+        view["outcome"] = "sent"
+        view["text_skipped"] = job.get("text_status") == "skipped_empty"
+    elif job is not None:
+        if _found_dir == "pending" and not _is_terminal_job(job):
+            # A still-retryable job in pending/ is pending,
+            # whatever its last item's status says; the terminal
+            # derivation only applies once the whole job is
+            # terminal (or stuck terminal in pending/).
+            view["outcome"] = "pending"
+            view["text_skipped"] = job.get("text_status") == "skipped_empty"
+        else:
+            _outcome, _skipped = _obs_job_outcome(job)
+            if _found_dir == "failed" and _outcome == "pending":
+                # A job archived in failed/ is a failure even if
+                # its item statuses alone look pending (e.g. a
+                # terminal flag with no bad item recorded yet):
+                # location wins over status derivation here.
+                _outcome = "failed"
+            view["outcome"] = _outcome
+            view["text_skipped"] = _skipped
+    _codes = []
+    if _terminal_code is not None:
+        _codes.append(_terminal_code)
+    if job is not None:
+        _derived = _obs_failure_code_for_job(job)
+        if _derived is not None and _derived not in _codes:
+            _codes.append(_derived)
+    view["failure_codes"] = _codes
+    # Analyzer states, by directory name + state string only.
+    # Only for a bare numeric message id; suffix jobs (queue
+    # notices, local replies) have no analysis directories.
+    if key.isdigit():
+        try:
+            for d in sorted(os.listdir(ANALYSIS_DIR)):
+                if d.startswith("%s_" % key) and os.path.isdir(os.path.join(ANALYSIS_DIR, d)):
+                    _st = "unknown"
+                    try:
+                        with open(os.path.join(ANALYSIS_DIR, d, "state.json"), encoding="utf-8") as f:
+                            _doc = json.load(f)
+                        if isinstance(_doc, dict) and isinstance(_doc.get("state"), str):
+                            _st = _doc["state"]
+                    except Exception:
+                        _st = "unknown"
+                    view["analysis_states"].append({"dir": d, "state": _st})
+        except Exception:
+            view["analysis_states"] = []
+        if any(a.get("state") == "failed" for a in view["analysis_states"]):
+            if "analysis_failed" not in view["failure_codes"]:
+                # analysis_failed is a view-level code for a failed
+                # analyzer run; it is not a timeline failure code
+                # (timeline codes stay in _OBS_FAILURE_REASONS).
+                view["failure_codes"].append("analysis_failed")
+    return view
+
+
+def _disk_watermark():
+    """Read-only disk watermark: (free MB, media dir MB), ints or None.
+
+    Only reports, never deletes, never warns on thresholds: callers
+    decide what a low number means. The media dir is the parent of
+    MEDIA_INBOUND (i.e. <root>/media); unreadable entries inside it
+    are skipped, never raised. Uses MEDIA_INBOUND (not ROOT) so
+    tests that rebind module paths still measure the right tree.
+    """
+    free_mb = None
+    try:
+        free_mb = int(shutil.disk_usage(MEDIA_INBOUND).free // (1024 * 1024))
+    except Exception:
+        free_mb = None
+    media_mb = None
+    try:
+        media_dir = os.path.dirname(MEDIA_INBOUND)
+        total = 0
+        for _dirpath, _dirnames, _filenames in os.walk(media_dir):
+            for _fn in _filenames:
+                try:
+                    _p = os.path.join(_dirpath, _fn)
+                    if os.path.islink(_p):
+                        continue
+                    total += os.path.getsize(_p)
+                except OSError:
+                    continue
+        media_mb = int(total // (1024 * 1024))
+    except Exception:
+        media_mb = None
+    return free_mb, media_mb
+
+
+def get_observability_summary():
+    """Counts across outbox dirs, each bucket separate. Read-only.
+
+    pending counts only jobs still retryable in pending/; a
+    terminal job stuck in pending/ (move failed) counts in its
+    terminal bucket, never as pending. needs_check, failed and
+    skipped_empty are separate buckets; sent is its own bucket.
+    Unreadable job files count under "unreadable", never silently
+    dropped. Only counts are returned, never job text or ids."""
+    summary = {
+        "schema": "observability-summary-0.1",
+        "generated_at": _now_utc_iso(),
+        "pending": 0,
+        "sent": 0,
+        "failed": 0,
+        "needs_check": 0,
+        "skipped_empty": 0,
+        "unreadable": 0,
+    }
+    try:
+        _sent_names = set(os.listdir(OUTBOX_SENT)) if os.path.isdir(OUTBOX_SENT) else set()
+    except Exception:
+        _sent_names = set()
+    # Gate 1 item 3: a progress receipt is not a formal delivery,
+    # so *_progress.json is counted in no bucket at all (sent,
+    # failed, pending, needs_check, skipped_empty all exclude it).
+    # Gate 1 item 4: same for *_offline.json (an offline receipt
+    # is not a formal delivery either).
+    # Waiting-prompt merge (2026-11-01): same for *_queue.json.
+    # Queue notices were never replies either; they used to count
+    # as sent, which overstated formal deliveries. Excluding them
+    # corrects the count: historical queue files on disk stop
+    # counting, so "sent" may drop by that many without any
+    # delivery being lost. Other bridge-written suffix jobs
+    # (fast replies, local replies) are genuine replies and keep
+    # their pre-existing counting.
+    summary["sent"] = len([n for n in _sent_names
+                           if n.endswith(".json")
+                           and not n.endswith("_progress.json")
+                           and not n.endswith("_offline.json")
+                           and not n.endswith("_queue.json")])
+    for _d in (OUTBOX_FAILED, OUTBOX_PENDING):
+        try:
+            _names = sorted(os.listdir(_d)) if os.path.isdir(_d) else []
+        except Exception:
+            continue
+        for name in _names:
+            if not name.endswith(".json"):
+                continue
+            if name.endswith("_progress.json"):
+                continue
+            if name.endswith("_offline.json"):
+                continue
+            if name.endswith("_queue.json"):
+                continue
+            try:
+                with open(os.path.join(_d, name), encoding="utf-8") as f:
+                    job = json.load(f)
+            except Exception:
+                summary["unreadable"] += 1
+                continue
+            if _d == OUTBOX_FAILED:
+                # Same bucket order as _obs_job_outcome, so the
+                # summary and the per-message view can never
+                # disagree about one job.
+                _outcome, _ = _obs_job_outcome(job)
+                if _outcome == "needs_check":
+                    summary["needs_check"] += 1
+                elif _outcome == "skipped_empty":
+                    summary["skipped_empty"] += 1
+                else:
+                    summary["failed"] += 1
+            else:
+                if _is_terminal_job(job):
+                    _outcome, _ = _obs_job_outcome(job)
+                    if _outcome == "needs_check":
+                        summary["needs_check"] += 1
+                    elif _outcome == "skipped_empty":
+                        summary["skipped_empty"] += 1
+                    else:
+                        summary["failed"] += 1
+                else:
+                    summary["pending"] += 1
+    _free_mb, _media_mb = _disk_watermark()
+    summary["disk_free_mb"] = _free_mb
+    summary["media_dir_size_mb"] = _media_mb
+    return summary
+
+
+# Gate 1 item 3 (2026-11-01): progress receipt for slow replies.
+#
+# When a message's formal reply takes longer than 5 seconds, the
+# user should hear "still working" instead of silence — but the
+# progress note must never disturb the formal reply. Rules:
+# - Trigger: a timeline "received" event exists, more than 5
+#   seconds have passed since it, and no formal job
+#   (<message_id>.json, exact name) exists in pending, sent or
+#   failed. A formal job that merely sits unsent still counts
+#   as "reply exists": the progress note must not second-guess
+#   a reply the Worker already produced. Queue notices
+#   (<mid>_queue.json) do NOT count as a formal reply.
+# - One attempt only: a persistent marker in
+#   state/progress_receipts.json is written BEFORE the queue
+#   write, so a crash between marker and send can never cause a
+#   second progress note. A failed queue write leaves the marker
+#   with ok=False and is never retried: the formal reply is
+#   unaffected either way.
+# - Independent message: the receipt is its own outbox job
+#   (<mid>_progress.json) with its own stable client_id
+#   ("progress-<mid>"), never the formal job's key. It does not
+#   rewrite, replace or truncate the formal reply, does not mark
+#   the formal job sent, and is excluded from every summary
+#   bucket. The evidence audit already only audits video replies
+#   (done record with videos, or an analysis dir), so a progress
+#   job can never produce an audit row.
+# - Content: one fixed sentence, no user text, no reply draft,
+#   no token. The job still carries the session context_token
+#   like every bridge-written job; drain scrubs it before
+#   archiving, same as queue notices.
+# - Observability: the send is recorded as a "progress" timeline
+#   event on the FORMAL job's timeline (source bridge_progress),
+#   separate from its sent event, and surfaced as progress_at in
+#   the per-message view. A failed queue write records no
+#   timeline event: an event must never claim a note was sent
+#   when it was not.
+# - Caller contract: maybe_send_progress_receipts() takes the
+#   outbox lock itself (_OUTBOX_LOCK is reentrant, so calling it
+#   from _sender_loop while the lock is held is safe). It never
+#   raises and never blocks sending: any failure is contained
+#   per candidate message.
+PROGRESS_RECEIPT_DELAY_SECONDS = 5.0
+PROGRESS_RECEIPT_TEXT = "还在处理中，稍等一下，我会把正式回复发给你。"
+PROGRESS_RECEIPT_SCHEMA = "progress-receipt-0.1"
+
+
+def _progress_client_id(mid):
+    """Stable idempotency key for one message's progress receipt.
+
+    Independent from the formal job's client_id by construction:
+    the formal job's key is its own uuid, this one is derived
+    from the message id with a progress-only prefix."""
+    return "progress-%s" % mid
+
+
+def _parse_utc_iso(ts):
+    """UTC ISO timestamp -> epoch seconds, or None if unparsable."""
+    if not isinstance(ts, str):
+        return None
+    try:
+        import datetime as _dt
+        _d = _dt.datetime.fromisoformat(ts)
+        if _d.tzinfo is None:
+            return None
+        return _d.timestamp()
+    except Exception:
+        return None
+
+
+def _progress_receipts_path():
+    return os.path.join(STATE, "progress_receipts.json")
+
+
+def _load_progress_receipts():
+    """Marker map mid -> {ts, client_id, ok}. Never raises."""
+    try:
+        with open(_progress_receipts_path(), encoding="utf-8") as f:
+            doc = json.load(f)
+        if isinstance(doc, dict) and isinstance(doc.get("receipts"), dict):
+            return doc["receipts"]
+    except Exception:
+        pass
+    return {}
+
+
+def _save_progress_receipts(receipts):
+    """Persist the marker map (0600, atomic). Never raises."""
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        atomic_write_json(_progress_receipts_path(),
+                          {"schema": PROGRESS_RECEIPT_SCHEMA,
+                           "receipts": receipts}, mode=0o600)
+        return True
+    except Exception:
+        return False
+
+
+def _progress_formal_job_exists(mid):
+    """True when the formal reply job exists in any outbox dir."""
+    name = "%s.json" % mid
+    for _d in (OUTBOX_PENDING, OUTBOX_SENT, OUTBOX_FAILED):
+        try:
+            if os.path.exists(os.path.join(_d, name)):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _progress_job_exists(mid):
+    """True when this message's progress job already exists."""
+    name = "%s_progress.json" % mid
+    for _d in (OUTBOX_PENDING, OUTBOX_SENT, OUTBOX_FAILED):
+        try:
+            if os.path.exists(os.path.join(_d, name)):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _earliest_received_map():
+    """Earliest timeline 'received' epoch per bare numeric id.
+
+    One pass over the timeline file, no per-job file reads.
+    Returns None when the timeline file cannot be read at all
+    (missing, unreadable, any read error): callers must treat
+    that as 'wait cannot be computed, send nothing', never as
+    'every message is overdue'. Unparsable lines/timestamps are
+    skipped, never treated as overdue. Never raises."""
+    received = {}
+    try:
+        with open(os.path.join(STATE, "message_timeline.jsonl"),
+                  encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(ev, dict) or ev.get("stage") != "received":
+                    continue
+                _mid = ev.get("job")
+                if not isinstance(_mid, str) or not _mid.isdigit():
+                    continue
+                _ts = _parse_utc_iso(ev.get("ts"))
+                if _ts is None:
+                    continue
+                if _mid not in received or _ts < received[_mid]:
+                    received[_mid] = _ts
+    except Exception:
+        return None
+    return received
+
+
+def maybe_send_progress_receipts(session, now=None):
+    """Queue one progress receipt per overdue message, at most once.
+
+    Returns the list of message ids for which a progress job was
+    queued this call (in sorted order). `now` is epoch seconds
+    and exists for tests: production passes None for time.time().
+    Never raises; a failure for one message never blocks others
+    or the formal replies. Must be called with the sender loop
+    running (it takes _OUTBOX_LOCK itself, which is reentrant)."""
+    queued = []
+    try:
+        if now is None:
+            now = time.time()
+        if not isinstance(session, dict) or not session.get("ilink_user_id"):
+            return queued
+        # Gate 1 item 4 (grace revision, 2026-11-01): progress
+        # suppression is PER MESSAGE, never global. A stale
+        # heartbeat alone must not silence progress: within the
+        # offline grace window the Worker may well be working
+        # (per-message wakeup plus ~60-75s pickup latency), so
+        # "still working" is a true statement there. Only a
+        # message that already got an offline receipt/job is
+        # suppressed below (its "will reply on return" promise
+        # stands; a progress note on top would stack a third
+        # message for one question).
+        receipts = _load_progress_receipts()
+        _offline_acks = _load_offline_receipts()
+        received = _earliest_received_map()
+        if received is None:
+            return queued
+        with _OUTBOX_LOCK:
+            for mid in sorted(received):
+                if mid in receipts:
+                    continue
+                # Gate 1 item 4: no stacking after recovery. A
+                # message that already got an offline receipt
+                # ("will reply on return") must not also get a
+                # progress note once the Worker is back: the
+                # formal reply is coming, the extra note adds
+                # nothing but a third message for one question.
+                if mid in _offline_acks:
+                    continue
+                if _offline_job_exists(mid):
+                    continue
+                if _progress_job_exists(mid):
+                    continue
+                if _progress_formal_job_exists(mid):
+                    continue
+                if now - received[mid] <= PROGRESS_RECEIPT_DELAY_SECONDS:
+                    continue
+                _cid = _progress_client_id(mid)
+                # Marker FIRST: a crash after this point must not
+                # cause a second progress note for this message.
+                receipts[mid] = {"ts": _now_utc_iso(), "client_id": _cid,
+                                 "ok": False}
+                _save_progress_receipts(receipts)
+                try:
+                    job = {"text": PROGRESS_RECEIPT_TEXT,
+                           "to_user_id": session.get("ilink_user_id"),
+                           "context_token": session.get("context_token") or "",
+                           "client_id": _cid}
+                    atomic_write_json(
+                        os.path.join(OUTBOX_PENDING, "%s_progress.json" % mid),
+                        job, mode=0o600)
+                except Exception as _e:
+                    print(f"serve: progress receipt queue FAILED for {mid} "
+                          f"(formal reply unaffected, no retry): "
+                          f"{_sanitize_error(_e)}", flush=True)
+                    continue
+                receipts[mid]["ok"] = True
+                _save_progress_receipts(receipts)
+                # Only a successfully queued note earns a timeline
+                # event, on the formal job's timeline.
+                record_timeline_event("%s.json" % mid, "progress",
+                                      source="bridge_progress")
+                queued.append(mid)
+                print(f"serve: progress receipt queued for {mid}", flush=True)
+        return queued
+    except Exception:
+        return queued
+
+
+# Gate 1 item 4 prerequisite (2026-11-01): Worker heartbeat
+# reading + bridge-side offline receipt. This is only the bridge
+# half: the Worker-side heartbeat WRITE is not in this code and
+# must be added to the production Worker instruction separately
+# (see the heartbeat contract below). Rules:
+#
+# - Heartbeat contract (writer = Worker, reader = bridge):
+#   state/worker_heartbeat.json, schema "worker-heartbeat-0.1",
+#   fields: ts (UTC ISO with seconds, e.g.
+#   2026-11-01T03:00:00+00:00) and source (a short writer tag,
+#   e.g. "worker"). The Worker writes it atomically (0600) at
+#   startup and then every 30 seconds while alive, and stops
+#   writing when it stops, so staleness is the offline signal.
+#   The writer's clock must be UTC-synced; a naive timestamp
+#   (no timezone) is invalid to the reader.
+# - RED LINE: the bridge only READS this file. It must never
+#   write a heartbeat itself: a bridge-written heartbeat would
+#   fake Worker liveness and hide a real outage. There is no
+#   code path in this file that writes worker_heartbeat.json.
+# - Offline判定: heartbeat file missing, unreadable, or its ts
+#   unparsable -> offline. ts older than 120 seconds (strictly
+#   greater; exactly 120s is still online) -> offline. 120s is
+#   4x the 30s write interval: it tolerates 2-3 missed beats
+#   from scheduling jitter without a false offline, yet still
+#   detects a real outage within about 2 minutes — not so
+#   small that normal jitter flips it, not so large that an
+#   outage goes unnoticed for half a day.
+# - Offline receipt (grace revision, 2026-11-01): when the
+#   heartbeat is stale AND an inbox message has waited strictly
+#   more than OFFLINE_RECEIPT_GRACE_SECONDS (180s) since its
+#   earliest timeline 'received' event AND no formal job exists
+#   AND no prior offline ack/job exists for it, the bridge
+#   queues one fixed receipt for that message:
+#   "蛋挞现在不在线，消息已收到，回来后会回复你。"
+#   It promises only "received, will be handled on return":
+#   never instant reply, never "Worker has read it". The
+#   receipt is its own outbox job (<mid>_offline.json) with its
+#   own stable client_id ("offline-<mid>"), never the formal
+#   job's key. A fresh heartbeat NEVER yields an offline
+#   receipt, however long the message has waited: a live Worker
+#   that is merely backlogged is not offline, and saying so
+#   would be a lie — such messages only ever get the normal
+#   formal reply (and progress notes while they wait).
+# - Cooling lock (anti-spam): one receipt per original message,
+#   forever, keyed by message id in
+#   state/offline_receipt_acks.json (0600, atomic, schema
+#   "offline-receipt-0.1", id/timestamp/client_id/ok only, no
+#   text, no token). Marker BEFORE the queue write (like
+#   progress receipts), ok=False never retried, and an
+#   already-existing offline job file also suppresses. This is
+#   also the global guard: a burst of new messages yields at
+#   most one short receipt per distinct message, never a
+#   repeated or stacked flood for the same message, across
+#   restarts and watchdog relaunches.
+# - NEVER consume the original: the receipt leaves the inbox
+#   record exactly where it is (not moved to done, not marked
+#   formally sent, no formal job created). When the Worker
+#   comes back online it picks the message up normally and its
+#   formal reply goes through the normal path.
+# - Recovery: when the heartbeat turns fresh again, nothing is
+#   re-sent, nothing is withdrawn, and no extra action is taken
+#   for messages that already got an offline receipt; formal
+#   replies just flow normally.
+# - Receipt send failure: only recorded (marker ok=False, no
+#   timeline event — an event must never claim a receipt was
+#   sent when it was not), never blocks the original message,
+#   never retried, never affects the post-recovery formal reply.
+# - Mutual exclusion with progress receipts (grace revision):
+#   suppression is PER MESSAGE, not global. Within the grace
+#   window a stale heartbeat does not silence progress: the
+#   Worker may be working (per-message wakeup plus pickup
+#   latency), so "still working" is true and the progress note
+#   fires normally. Only a message that already has an offline
+#   ack/job is suppressed from progress, so recovery does not
+#   stack a progress note on top of the offline receipt. The
+#   reverse order is deliberately asymmetric: a message that
+#   got a progress note and then outlives both the heartbeat
+#   and the grace window may still get one offline receipt
+#   later, because that sequence (was working, then went
+#   offline) is a genuine status change, not a duplicate.
+# - DEPLOYMENT ORDER NOTE (revised by the grace revision):
+#   the pre-grace version read "no heartbeat file" as offline
+#   and fired immediately, which would have suppressed all
+#   progress receipts and spammed offline receipts for normal
+#   messages merely waiting out Worker pickup latency. The
+#   grace revision removes both catastrophic pre-heartbeat
+#   behaviors: progress is no longer gated on the global
+#   heartbeat at all, and offline receipts are gated by the
+#   180s wait plus the no-formal-job rule. The Worker heartbeat
+#   writing SHOULD still go live first for accurate
+#   online/offline distinction: without any heartbeat, a
+#   message whose Worker is alive but takes over 180s to
+#   produce a reply would still earn an offline receipt, and
+#   a fresh heartbeat is the only thing that prevents that.
+#   Once the Worker beats every 30s, bridge restarts are safe:
+#   the heartbeat file persists in state/ across restarts.
+# - Observability: a successfully queued receipt earns an
+#   "offline_receipt" timeline event on the FORMAL job's
+#   timeline (source bridge_offline), surfaced as
+#   offline_receipt_at in the per-message view, separate from
+#   stages.sent. The summary excludes *_offline.json from
+#   every bucket. The evidence audit only audits video replies,
+#   so an offline job can never produce an audit row.
+# - Caller contract: maybe_send_offline_receipts() takes the
+#   outbox lock itself (reentrant, same as progress). It never
+#   raises and never blocks sending.
+WORKER_HEARTBEAT_SCHEMA = "worker-heartbeat-0.1"
+WORKER_HEARTBEAT_INTERVAL_SECONDS = 30
+WORKER_HEARTBEAT_STALE_SECONDS = 120
+# Grace revision (2026-11-01): an offline receipt fires only
+# after a message has waited this long with no formal job. 180s
+# is more than twice the measured Worker pickup latency
+# (~60-75s from inbox write to formal job), so normal messages
+# never trip it, yet a genuine outage is still noticed after
+# about 3 minutes of waiting. It must never be set below the
+# pickup latency (the idle-false-alarm defect returns) nor in
+# the tens of minutes (a real outage would go unnoticed).
+OFFLINE_RECEIPT_GRACE_SECONDS = 180
+OFFLINE_RECEIPT_TEXT = "蛋挞现在不在线，消息已收到，回来后会回复你。"
+OFFLINE_RECEIPT_SCHEMA = "offline-receipt-0.1"
+
+
+def _worker_heartbeat_path():
+    return os.path.join(STATE, "worker_heartbeat.json")
+
+
+def read_worker_heartbeat():
+    """Read the Worker heartbeat. Returns (epoch_or_None, source).
+
+    Bridge-side READ ONLY (see the red line in the block above):
+    this function never writes, and no other function in this file
+    writes worker_heartbeat.json. A missing file, unreadable JSON,
+    a non-dict document, or an unparsable/naive ts all yield
+    (None, None), which the offline check treats as offline.
+    Never raises."""
+    try:
+        with open(_worker_heartbeat_path(), encoding="utf-8") as f:
+            doc = json.load(f)
+        if not isinstance(doc, dict):
+            return None, None
+        _ts = _parse_utc_iso(doc.get("ts"))
+        _src = doc.get("source")
+        if not isinstance(_src, str):
+            _src = None
+        return _ts, _src
+    except Exception:
+        return None, None
+
+
+def is_worker_offline(now=None):
+    """True when the Worker must be treated as offline.
+
+    Missing/unparsable heartbeat -> offline. ts strictly older
+    than WORKER_HEARTBEAT_STALE_SECONDS -> offline; exactly at
+    the threshold is still online. `now` is epoch seconds and
+    exists for tests; production passes None for time.time().
+    Never raises."""
+    try:
+        if now is None:
+            now = time.time()
+        _ts, _ = read_worker_heartbeat()
+        if _ts is None:
+            return True
+        return now - _ts > WORKER_HEARTBEAT_STALE_SECONDS
+    except Exception:
+        return True
+
+
+def _offline_client_id(mid):
+    """Stable idempotency key for one message's offline receipt.
+
+    Independent from the formal job's client_id by construction:
+    the formal job's key is its own uuid, this one is derived
+    from the message id with an offline-only prefix."""
+    return "offline-%s" % mid
+
+
+def _offline_receipts_path():
+    return os.path.join(STATE, "offline_receipts.json")
+
+
+def _load_offline_receipts():
+    """Marker map mid -> {ts, client_id, ok}. Never raises."""
+    try:
+        with open(_offline_receipts_path(), encoding="utf-8") as f:
+            doc = json.load(f)
+        if isinstance(doc, dict) and isinstance(doc.get("receipts"), dict):
+            return doc["receipts"]
+    except Exception:
+        pass
+    return {}
+
+
+def _save_offline_receipts(receipts):
+    """Persist the marker map (0600, atomic). Never raises."""
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        atomic_write_json(_offline_receipts_path(),
+                          {"schema": OFFLINE_RECEIPT_SCHEMA,
+                           "receipts": receipts}, mode=0o600)
+        return True
+    except Exception:
+        return False
+
+
+def _offline_job_exists(mid):
+    """True when this message's offline job already exists."""
+    name = "%s_offline.json" % mid
+    for _d in (OUTBOX_PENDING, OUTBOX_SENT, OUTBOX_FAILED):
+        try:
+            if os.path.exists(os.path.join(_d, name)):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def maybe_send_offline_receipts(session, now=None):
+    """Queue one offline receipt per unprocessed inbox message.
+
+    Returns the list of message ids for which an offline job was
+    queued this call (in sorted order). `now` is epoch seconds
+    and exists for tests: production passes None for time.time().
+    All four gates must hold before a receipt is queued: (1)
+    the heartbeat is stale (missing/unparsable/naive ts, or ts
+    strictly more than WORKER_HEARTBEAT_STALE_SECONDS old);
+    (2) the message has waited strictly more than
+    OFFLINE_RECEIPT_GRACE_SECONDS since its earliest timeline
+    'received' event (no received event means the wait cannot
+    be computed: never guess, never send); (3) no formal job
+    exists in pending/sent/failed; (4) no prior offline ack
+    record and no existing offline job file for the message.
+    The original inbox record is never touched: no move to done,
+    no formal job, no sent marking — the Worker can still pick
+    it up normally after recovery. Never raises; a failure for
+    one message never blocks others or the formal replies. Must
+    be called with the sender loop running (it takes
+    _OUTBOX_LOCK itself, which is reentrant)."""
+    queued = []
+    try:
+        if now is None:
+            now = time.time()
+        if not isinstance(session, dict) or not session.get("ilink_user_id"):
+            return queued
+        if not is_worker_offline(now):
+            return queued
+        receipts = _load_offline_receipts()
+        received = _earliest_received_map()
+        if received is None:
+            return queued
+        try:
+            _names = sorted(os.listdir(INBOX)) if os.path.isdir(INBOX) else []
+        except Exception:
+            return queued
+        with _OUTBOX_LOCK:
+            for name in _names:
+                if not name.endswith(".json"):
+                    continue
+                mid = name[:-5]
+                if not mid.isdigit():
+                    continue
+                if mid in receipts:
+                    continue
+                if _offline_job_exists(mid):
+                    continue
+                # A formal job already exists: the Worker produced
+                # a reply (it just has not moved inbox->done yet),
+                # so an "offline" receipt would be misleading even
+                # with a stale heartbeat. The formal reply drains
+                # normally instead.
+                if _progress_formal_job_exists(mid):
+                    continue
+                # Grace gate (2026-11-01 revision): the Worker
+                # is woken per message and pickup takes ~60-75s,
+                # so a stale heartbeat right after arrival proves
+                # nothing — idle gaps over 2 minutes are normal.
+                # Only a message that has waited longer than
+                # OFFLINE_RECEIPT_GRACE_SECONDS with no formal
+                # job earns an offline receipt. No received
+                # event means the wait cannot be computed:
+                # never guess, never send.
+                _recv = received.get(mid)
+                if _recv is None:
+                    continue
+                if now - _recv <= OFFLINE_RECEIPT_GRACE_SECONDS:
+                    continue
+                _cid = _offline_client_id(mid)
+                # Marker FIRST: a crash after this point must not
+                # cause a second offline receipt for this message.
+                receipts[mid] = {"ts": _now_utc_iso(), "client_id": _cid,
+                                 "ok": False}
+                _save_offline_receipts(receipts)
+                try:
+                    job = {"text": OFFLINE_RECEIPT_TEXT,
+                           "to_user_id": session.get("ilink_user_id"),
+                           "context_token": session.get("context_token") or "",
+                           "client_id": _cid}
+                    atomic_write_json(
+                        os.path.join(OUTBOX_PENDING, "%s_offline.json" % mid),
+                        job, mode=0o600)
+                except Exception as _e:
+                    print(f"serve: offline receipt queue FAILED for {mid} "
+                          f"(original untouched, no retry): "
+                          f"{_sanitize_error(_e)}", flush=True)
+                    continue
+                receipts[mid]["ok"] = True
+                _save_offline_receipts(receipts)
+                # Only a successfully queued receipt earns a
+                # timeline event, on the formal job's timeline.
+                record_timeline_event("%s.json" % mid, "offline_receipt",
+                                      source="bridge_offline")
+                queued.append(mid)
+                print(f"serve: offline receipt queued for {mid}", flush=True)
+        return queued
+    except Exception:
+        return queued
+
+
+# Gate 2 item 4 (2026-11-01): same-source merge.
+#
+# DISPATCH-CHAIN FINDING (read the code, do not assume): serve polls
+# getupdates, downloads/decrypts media, writes inbox/<mid>.json, and
+# only then marks the message processed. The bridge NEVER wakes the
+# Worker itself: the watchdog hook, outside this file, wakes the
+# Worker per inbox file, the Worker reads inbox records and writes
+# outbox/pending/<mid>.json formal jobs, and _sender_loop drains
+# them every second. There is therefore no bridge function that can
+# turn several inbox files into one Worker inference task. Merge
+# must live at the intake staging layer instead:
+#
+# - When the switch is ON, a normal Worker-bound message is NOT
+#   written to inbox immediately. It is staged in bridge-private
+#   state/merge_staging/ (never in inbox/, so the watchdog never
+#   delivers it) with its full record plus its intake context
+#   token (staging files are bridge-private, 0600, never
+#   Worker-visible).
+# - _sender_loop promotes due groups every second. A group is all
+#   staged records from one from_user_id inside one FIXED window
+#   (MERGE_WINDOW_SECONDS from the FIRST message's received time;
+#   fixed, not sliding, so a steady stream cannot merge forever
+#   and added latency is bounded by the window).
+# - A due group of >= 2 becomes ONE merged inbox record anchored
+#   on the FIRST-STAGED message (staging order == serve processing
+#   order == typing-ticket holder, so the anchor's formal job
+#   always cancels the ticket), plus a bridge-private manifest.
+#   A due single is promoted VERBATIM (byte-identical record, no
+#   merged fields), so singles behave exactly like the pre-merge
+#   path.
+# - When the switch is OFF, serve writes inbox directly (old
+#   path). Already-staged groups are still promoted verbatim on
+#   the next tick/startup, never stranded.
+#
+# TOKEN TENSION, RESOLVED DELIBERATELY (deviation from the brief's
+# literal "send with the last message's token", with reasons):
+# inbox/done records carry NO context_token by B2-lite (only the
+# session holds the latest token), so the merged inbox record
+# likewise carries NO token. Per-message tokens are preserved
+# ONLY in the bridge-private manifest, for audit, and are NEVER
+# auto-used for sending: formal replies keep the B2-lite
+# session-token-first rule, and a token failure goes to
+# needs_check without a silent swap. The supplement's "use the
+# last token" is therefore recorded as UNVERIFIED and NOT adopted
+# as a send rule; it must be validated with a real WeChat case
+# before any use. The Worker-cooperation note (parent appends it
+# separately, never this file's job) must tell the Worker: reply
+# ONCE for the anchor id, cite source message ids when quoting,
+# never reply separately to constituents, never open
+# state/merge_* files.
+#
+# COST, STATED PLAINLY: with the switch ON, every message waits
+# up to one window before inbox delivery (singles included).
+# Against ~60s Worker pickup latency this is negligible, but it
+# is real: the switch trades <= 5s of intake latency for merge.
+MERGE_WINDOW_SECONDS = 5.0
+MERGE_FLAG_NAME = "same_source_merge.json"
+MERGE_STAGING_DIRNAME = "merge_staging"
+MERGE_MANIFESTS_DIRNAME = "merge_manifests"
+MERGE_COMPLETED_DIRNAME = "merge_completed"
+MERGE_STAGED_SCHEMA = "merge-staged-0.1"
+MERGE_MANIFEST_SCHEMA = "merge-manifest-0.1"
+MERGE_COMPLETED_SCHEMA = "merge-completed-0.1"
+
+
+def _merge_flag_path():
+    return os.path.join(STATE, MERGE_FLAG_NAME)
+
+
+def _merge_staging_dir():
+    return os.path.join(STATE, MERGE_STAGING_DIRNAME)
+
+
+def _merge_manifests_dir():
+    return os.path.join(STATE, MERGE_MANIFESTS_DIRNAME)
+
+
+def _merge_completed_dir():
+    return os.path.join(STATE, MERGE_COMPLETED_DIRNAME)
+
+
+def read_same_source_merge_mode():
+    """True iff state/same_source_merge.json says enabled.
+
+    Read fresh on every use (no restart needed to flip). Missing
+    or corrupt file means OFF. Default is OFF: deploy merged code
+    with the switch OFF until a real WeChat merge test passes.
+    """
+    try:
+        with open(_merge_flag_path(), "r", encoding="utf-8") as f:
+            return bool(json.load(f).get("enabled"))
+    except Exception:
+        return False
+
+
+def _merge_mid_key(mid):
+    try:
+        return (0, int(mid))
+    except Exception:
+        return (1, str(mid))
+
+
+def _merge_iso(ts_seconds):
+    """Format epoch seconds as Asia/Shanghai wall time for merged segments.
+
+    Root-cause note (2026-11-01 live test): the old version referenced
+    module-level ``datetime``, which bridge.py never imports at module
+    scope (it only imports datetime locally inside functions), so the
+    call always raised NameError and the blanket except returned "" —
+    every merged segment rendered "[源消息 <mid> @ ]" with an empty
+    time. Fixed with a local import, ZoneInfo("Asia/Shanghai") so the
+    label matches the wall time the user sees, and a fixed UTC+8
+    fallback if zone data is missing. Invalid input still returns "".
+    """
+    try:
+        import datetime as _dt
+        ts = float(ts_seconds)
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo("Asia/Shanghai")
+        except Exception:
+            tz = _dt.timezone(_dt.timedelta(hours=8))
+        return _dt.datetime.fromtimestamp(ts, tz=tz).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+
+
+def _merge_staging_for_sender(from_user_id):
+    """Staged dicts for one sender, in STAGING order.
+
+    Order is the staging files' mtime (serve processing order),
+    NOT received_ts: the anchor must be the first-staged message,
+    because the typing ticket goes to the first-staged message
+    and only the anchor's formal job can cancel it. If order
+    came from received_ts, a clock jump could split anchor from
+    ticket holder and leak a ticket forever. received_ts is used
+    only for window math. Corrupt staging files are skipped
+    loudly and left in place for inspection, never silently
+    dropped and never deleted. The sort key lives only in
+    memory (_staging_seq), never on disk or in merged records.
+    """
+    out = []
+    d = _merge_staging_dir()
+    try:
+        names = sorted(os.listdir(d)) if os.path.isdir(d) else []
+    except Exception:
+        return out
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(d, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                doc = json.load(f)
+        except Exception:
+            print(f"serve: merge staging corrupt, left in place: {name}", flush=True)
+            continue
+        if not isinstance(doc, dict) or doc.get("schema") != MERGE_STAGED_SCHEMA:
+            continue
+        if doc.get("from_user_id") != from_user_id:
+            continue
+        try:
+            doc["_staging_seq"] = os.stat(path).st_mtime_ns
+        except Exception:
+            doc["_staging_seq"] = 0
+        out.append(doc)
+    out.sort(key=lambda x: (x.get("_staging_seq", 0), _merge_mid_key(x.get("message_id", ""))))
+    return out
+
+
+def _merge_all_staged():
+    """All staged dicts grouped by sender, in staging order.
+
+    See _merge_staging_for_sender for why order is mtime, not
+    received_ts. Never raises.
+    """
+    grouped = {}
+    d = _merge_staging_dir()
+    try:
+        names = sorted(os.listdir(d)) if os.path.isdir(d) else []
+    except Exception:
+        return grouped
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(d, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                doc = json.load(f)
+        except Exception:
+            print(f"serve: merge staging corrupt, left in place: {name}", flush=True)
+            continue
+        if not isinstance(doc, dict) or doc.get("schema") != MERGE_STAGED_SCHEMA:
+            continue
+        try:
+            doc["_staging_seq"] = os.stat(path).st_mtime_ns
+        except Exception:
+            doc["_staging_seq"] = 0
+        grouped.setdefault(doc.get("from_user_id"), []).append(doc)
+    for docs in grouped.values():
+        docs.sort(key=lambda x: (x.get("_staging_seq", 0), _merge_mid_key(x.get("message_id", ""))))
+    return grouped
+
+
+def stage_merge_message(mid, from_user_id, record, context_token, received_ts=None):
+    """Stage one intake record for later merge promotion.
+
+    Returns (ok, is_first): is_first is True when this message
+    starts a new group for its sender (no other staged records
+    for that sender existed before this write). The caller uses
+    is_first for the typing ticket: only the group's first
+    message gets a ticket, because only the anchor ever gets a
+    formal job that cancels it. On failure returns (False,
+    False); the caller must NOT mark the message processed.
+    """
+    try:
+        first = not _merge_staging_for_sender(from_user_id)
+        os.makedirs(_merge_staging_dir(), exist_ok=True)
+        doc = {
+            "schema": MERGE_STAGED_SCHEMA,
+            "message_id": str(mid),
+            "from_user_id": from_user_id,
+            "received_ts": float(received_ts) if received_ts is not None else time.time(),
+            # Bridge-private: staging files are never Worker-visible,
+            # so holding the intake token here does not violate
+            # B2-lite (which bans tokens in Worker-visible records).
+            # It is used ONLY for the private manifest, never for
+            # sending and never copied into the merged record.
+            "context_token": context_token or "",
+            "record": record,
+        }
+        atomic_write_json(os.path.join(_merge_staging_dir(), "%s.json" % mid), doc, mode=0o600)
+        return True, first
+    except Exception:
+        return False, False
+
+
+def build_merged_record(staged):
+    """Build (merged_record, manifest) from sorted staged dicts.
+
+    staged must be non-empty and contain no local_only record
+    (local-only placeholders are never merged; the caller must
+    promote those verbatim). Raises ValueError otherwise.
+    The merged record carries NO context_token (B2-lite).
+    """
+    if not staged:
+        raise ValueError("empty merge group")
+    for doc in staged:
+        if isinstance(doc.get("record"), dict) and doc["record"].get("local_only"):
+            raise ValueError("local_only record must never merge")
+    anchor = staged[0]
+    anchor_mid = str(anchor.get("message_id"))
+    mids = [str(d.get("message_id")) for d in staged]
+    sections = []
+    images, videos, files = [], [], []
+    analyses, video_errors, image_errors, file_errors = [], [], [], []
+    parts = []
+    merged_quotes = []
+    for doc in staged:
+        rec = doc.get("record") or {}
+        mid = str(doc.get("message_id"))
+        ts_ms = rec.get("ts")
+        header = "[源消息 %s @ %s]" % (mid, _merge_iso(float(ts_ms) / 1000.0) if ts_ms else _merge_iso(doc.get("received_ts")))
+        body = rec.get("text") or ""
+        lines = [header]
+        if body:
+            lines.append(body)
+        else:
+            lines.append("(无文字内容)")
+        for kind, items in (("图片", rec.get("images") or []),
+                            ("视频", rec.get("videos") or []),
+                            ("文件", rec.get("files") or [])):
+            for item in items:
+                base = os.path.basename(str(item)) if not isinstance(item, dict) else str(item.get("path") or item)
+                lines.append("[附件：%s %s（源消息 %s）]" % (kind, base, mid))
+        sections.append("\n".join(lines))
+        images.extend(rec.get("images") or [])
+        videos.extend(rec.get("videos") or [])
+        files.extend(rec.get("files") or [])
+        analyses.extend(rec.get("analysis") or [])
+        video_errors.extend(rec.get("video_errors") or [])
+        image_errors.extend(rec.get("image_errors") or [])
+        file_errors.extend(rec.get("file_errors") or [])
+        parts.append({
+            "message_id": mid,
+            "ts_ms": ts_ms,
+            "text": body,
+            "images": list(rec.get("images") or []),
+            "videos": list(rec.get("videos") or []),
+            "files": list(rec.get("files") or []),
+        })
+        if rec.get("quote"):
+            merged_quotes.append({"source_message_id": mid, "quote": rec.get("quote")})
+    first_rec = anchor.get("record") or {}
+    record = {
+        "message_id": anchor.get("message_id"),
+        "text": "\n\n".join(sections),
+        "from_user_id": anchor.get("from_user_id"),
+        "ts": first_rec.get("ts") or int(float(anchor.get("received_ts") or 0) * 1000),
+        "history_class": "user",
+        "egress_policy": "muse_default",
+        "policy_version": first_rec.get("policy_version") or SAFE_VIEW_VERSION,
+        "merged": True,
+        "merged_message_ids": mids,
+        "merged_parts": parts,
+    }
+    # No top-level "quote": with several constituents, a single
+    # quote field would be ambiguous. Quotes live ONLY in
+    # merged_quotes with their source message id, so a reply
+    # quoting one part can cite exactly that part.
+    if merged_quotes:
+        record["merged_quotes"] = merged_quotes
+    if images:
+        record["images"] = images
+    if videos:
+        record["videos"] = videos
+    if files:
+        record["files"] = files
+    if analyses:
+        record["analysis"] = analyses
+    if video_errors:
+        record["video_errors"] = video_errors
+    if image_errors:
+        record["image_errors"] = image_errors
+    if file_errors:
+        record["file_errors"] = file_errors
+    manifest = {
+        "schema": MERGE_MANIFEST_SCHEMA,
+        "anchor_message_id": anchor_mid,
+        "merged_message_ids": mids,
+        "window_seconds": MERGE_WINDOW_SECONDS,
+        "first_received_ts": float(staged[0].get("received_ts") or 0),
+        "parts": [{
+            "message_id": str(d.get("message_id")),
+            "received_ts": float(d.get("received_ts") or 0),
+            "ts_ms": (d.get("record") or {}).get("ts"),
+            "n_images": len((d.get("record") or {}).get("images") or []),
+            "n_videos": len((d.get("record") or {}).get("videos") or []),
+            "n_files": len((d.get("record") or {}).get("files") or []),
+            "has_text": bool((d.get("record") or {}).get("text")),
+        } for d in staged],
+        # Bridge-private audit only. NEVER auto-used for sending:
+        # formal replies keep the B2-lite session-token-first rule.
+        # The supplement's "use the last message's token" is
+        # UNVERIFIED and NOT adopted as a send rule until a real
+        # WeChat case validates it.
+        "tokens_by_message": {str(d.get("message_id")): (d.get("context_token") or "") for d in staged},
+        "tokens_unverified_for_send": True,
+        "send_token_note": "B2-lite: send with the session token; last-message token hypothesis UNVERIFIED, do not use without a real WeChat validation.",
+    }
+    return record, manifest
+
+
+def _merge_remove_staged(mids):
+    for mid in mids:
+        try:
+            os.remove(os.path.join(_merge_staging_dir(), "%s.json" % mid))
+        except Exception:
+            pass
+
+
+def maybe_promote_merge_groups(now=None):
+    """Promote due staged groups to inbox. Returns anchor mids.
+
+    Runs every sender-loop tick and at serve startup. Never
+    raises. Semantics:
+    - Switch OFF: promote every staged record VERBATIM at once
+      (drains staging, never strands a message).
+    - Switch ON, fixed window: a group is due when now minus
+      its FIRST message's received_ts is >= MERGE_WINDOW_SECONDS.
+      Due singles go verbatim; due groups of >= 2 go as one
+      merged record (manifest written first, then inbox record).
+    - A group containing a local_only record is never merged:
+      its members go verbatim.
+    - If the inbox record already exists (a previous promotion
+      wrote it but staging removal failed), staging is cleaned
+      without rewriting, so promotion is idempotent.
+    - Timeline "received" is recorded at promotion (the moment
+      the Worker can first see the record), matching the old
+      inbox-write moment. Constituent timestamps live in the
+      merged record and manifest, not in the timeline.
+    """
+    promoted = []
+    try:
+        if now is None:
+            now = time.time()
+        mode_on = read_same_source_merge_mode()
+        grouped = _merge_all_staged()
+        for sender in sorted(grouped, key=str):
+            docs = grouped[sender]
+            if not docs:
+                continue
+            first_ts = float(docs[0].get("received_ts") or 0)
+            if mode_on and (now - first_ts) < MERGE_WINDOW_SECONDS:
+                continue
+            mids = [str(d.get("message_id")) for d in docs]
+            has_local_only = any(isinstance(d.get("record"), dict) and d["record"].get("local_only") for d in docs)
+            try:
+                if len(docs) >= 2 and mode_on and not has_local_only:
+                    record, manifest = build_merged_record(docs)
+                    anchor = str(docs[0].get("message_id"))
+                    inbox_path = os.path.join(INBOX, "%s.json" % anchor)
+                    if not os.path.exists(inbox_path):
+                        os.makedirs(_merge_manifests_dir(), exist_ok=True)
+                        atomic_write_json(os.path.join(_merge_manifests_dir(), "%s.json" % anchor), manifest, mode=0o600)
+                        atomic_write_json(inbox_path, record, mode=0o600)
+                        record_timeline_event("%s.json" % anchor, "received", source="serve_inbox_write")
+                        # Gate 3 step 2: only the anchor row is
+                        # mirrored (constituent timestamps live in
+                        # the merged record and manifest, not here;
+                        # the private manifest itself never enters
+                        # the shadow -- it holds a token map).
+                        _shadow_upsert_inbound(anchor, record)
+                    _merge_remove_staged(mids)
+                    promoted.append(anchor)
+                    print(f"serve: merge promoted {len(mids)} messages as {anchor}.json", flush=True)
+                else:
+                    for doc in docs:
+                        mid = str(doc.get("message_id"))
+                        inbox_path = os.path.join(INBOX, "%s.json" % mid)
+                        if not os.path.exists(inbox_path):
+                            atomic_write_json(inbox_path, doc.get("record") or {}, mode=0o600)
+                            record_timeline_event("%s.json" % mid, "received", source="serve_inbox_write")
+                            # Gate 3 step 2: shadow inbound mirror.
+                            _shadow_upsert_inbound(mid, doc.get("record") or {})
+                        _merge_remove_staged([mid])
+                        promoted.append(mid)
+            except Exception as _prom_e:
+                # Staging is retained: the next tick retries. Never
+                # mark anything delivered that was not written.
+                print(f"serve: merge promote FAILED for {sender}: {_sanitize_error(_prom_e)}", flush=True)
+                continue
+        return promoted
+    except Exception:
+        return promoted
+
+
+def maybe_record_merge_completions():
+    """Write completion records for merged anchors already sent.
+
+    Lazy scanner (sender loop, after drain): for each manifest
+    without a completion record, if outbox/sent/<anchor>.json
+    exists, the formal reply for the whole group was sent, so
+    record every constituent mid as completed. Never raises,
+    never touches inbox/done (the Worker owns the done move),
+    never deletes manifests (they are the audit trail).
+    """
+    try:
+        mdir = _merge_manifests_dir()
+        cdir = _merge_completed_dir()
+        if not os.path.isdir(mdir):
+            return
+        for name in sorted(os.listdir(mdir)):
+            if not name.endswith(".json"):
+                continue
+            anchor = name[:-5]
+            try:
+                if os.path.exists(os.path.join(cdir, name)):
+                    continue
+                if not os.path.exists(os.path.join(OUTBOX_SENT, "%s.json" % anchor)):
+                    continue
+                with open(os.path.join(mdir, name), encoding="utf-8") as f:
+                    manifest = json.load(f)
+                if not isinstance(manifest, dict):
+                    continue
+                os.makedirs(cdir, exist_ok=True)
+                atomic_write_json(os.path.join(cdir, name), {
+                    "schema": MERGE_COMPLETED_SCHEMA,
+                    "anchor_message_id": anchor,
+                    "merged_message_ids": manifest.get("merged_message_ids") or [anchor],
+                    "formal_sent": True,
+                    "completed_ts": _now_utc_iso(),
+                }, mode=0o600)
+            except Exception:
+                continue
+    except Exception:
+        return
+
+
+# ---- Gate 3 step 2: SQLite authority (design
+# docs/sqlite-write-switch-design-DRAFT.md, sections 1-3 and 6).
+# Default mode is json: every helper below is a no-op in json mode
+# and the serve/drain loops behave exactly as before (zero behavior
+# change, and no bridge.db file is ever created). Dual/shadow modes
+# are operator actions (mode file), never flipped by this code.
+# Two deliberate deviations from the transition table, both forced
+# by compare-consistency (see bridge_sqlite.mirror_job_terminal):
+# the table has no ready_to_send -> needs_check edge, yet pre-send
+# terminal dispositions (recipient gate, sanitize, plan mismatch)
+# must land in the same terminal state the JSON snapshot mapping
+# reports, so they use a direct, audited update that never moves a
+# row OUT of a terminal state. Likewise pending -> ready_to_send
+# has no edge (claim is Worker-side), yet a pending-dir JSON file
+# IS the production fact, so first-seen converges it directly.
+# Two parent-decided amendments (2026-11-01, before any dual soak):
+# (1) Retryable reset: a drain pass that keeps a job pending on an
+# explicitly-undelivered Retryable failure resets the shadow row
+# sending_in_flight -> ready_to_send with its send lease cleared
+# (see _shadow_reset_for_retry), so the next drain can begin_send
+# again under JSON's immediate 3-attempt retry. Without it, the job
+# would be skipped by first-seen until its 120s lease expired, then
+# locked to needs_check -- losing the retry entirely. Unknown /
+# timeout / interrupt outcomes never reset: they go terminal ->
+# needs_check as before, and terminal rows are never downgraded.
+# (2) Benign inbound lag: the bridge never observes the Worker
+# moving inbox/ -> done/, so a shadow inbound row stays "received"
+# while JSON says "processed" (same record hash). Compare now
+# reports that exact triple as benign_lag (listed separately, not
+# a mismatch) instead of a difference -- so a dual soak CAN be
+# compare-clean while the Worker processes messages. No done-sweep
+# write point was added (design 3.1 still forbids off-table write
+# points) and compare stays read-only.
+_SQLITE_AUTHORITY_MODE = None  # cached at serve startup; None = unread
+_SHADOW_LAST_LEASE_TICK = 0.0
+_SHADOW_SEND_LEASE_SECONDS = 120  # == bridge_sqlite.begin_send default
+
+
+def _shadow_root():
+    return os.path.dirname(STATE)
+
+
+def _shadow_db_path():
+    return os.path.join(STATE, "bridge.db")
+
+
+def refresh_sqlite_authority():
+    """Read the mode file once and cache it. A running mode change
+    does NOT take effect until serve restarts (design 2.1). Invalid
+    values and a missing shadow module both fall back to json,
+    loudly: an invalid value must never silently become shadow.
+    Returns the mode. Never raises."""
+    global _SQLITE_AUTHORITY_MODE
+    if _SHADOW_MOD is None:
+        _SQLITE_AUTHORITY_MODE = "json"
+        try:
+            with open(os.path.join(STATE, "sqlite_authority.json"),
+                      encoding="utf-8") as f:
+                _doc = json.load(f)
+            if isinstance(_doc, dict) and _doc.get("mode") in ("dual", "shadow"):
+                print("shadow: module unavailable, falling back to json mode (loud)", flush=True)
+                try:
+                    write_failure_record("sqlite_authority", "shadow",
+                                         {"kind": "shadow_module_missing",
+                                          "mode": _doc.get("mode")})
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return "json"
+    try:
+        mode, valid = _SHADOW_MOD.read_authority_mode(_shadow_root())
+    except Exception:
+        mode, valid = "json", False
+    if not valid:
+        print("shadow: invalid authority mode value, falling back to json (never silently shadow)", flush=True)
+        try:
+            write_failure_record("sqlite_authority", "shadow",
+                                 {"kind": "shadow_mode_invalid"})
+        except Exception:
+            pass
+        mode = "json"
+    _SQLITE_AUTHORITY_MODE = mode
+    print(f"shadow: authority mode={mode}", flush=True)
+    return mode
+
+
+def get_sqlite_mode():
+    if _SQLITE_AUTHORITY_MODE is None:
+        return refresh_sqlite_authority()
+    return _SQLITE_AUTHORITY_MODE
+
+
+def _shadow_tracked(name):
+    """Mirror json_snapshot's auxiliary-job exclusion: bridge-written
+    receipt jobs (_progress/_offline/_queue) are NOT shadow-tracked
+    and get no shadow rows in any mode. Anything else is tracked."""
+    if _SHADOW_MOD is None:
+        return False
+    return _SHADOW_MOD._is_shadow_tracked_job_name(name)
+
+
+def _shadow_mark(kind, job_key, extra=None):
+    diag = {"kind": kind}
+    if extra:
+        diag.update(extra)
+    try:
+        write_failure_record(job_key, "shadow", diag)
+    except Exception:
+        pass
+
+
+def _shadow_guarded(kind, job_key, fn):
+    """Run fn(conn) with a fresh shadow connection: commit on success,
+    rollback on error. Returns (True, result) or (False, None).
+    Never raises. In json mode (or with no module) it returns
+    (False, None) WITHOUT touching the DB or writing a marker: json
+    mode means the shadow is not read at all."""
+    if _SHADOW_MOD is None or get_sqlite_mode() == "json":
+        return False, None
+    try:
+        conn = _SHADOW_MOD.connect_shadow(_shadow_db_path())
+    except Exception as e:
+        _shadow_mark("shadow_open_failed", job_key,
+                     {"error": type(e).__name__})
+        print(f"shadow: open failed for {job_key}: {_sanitize_error(e)}", flush=True)
+        return False, None
+    try:
+        result = fn(conn)
+        conn.commit()
+        return True, result
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        _shadow_mark(kind, job_key, {"error": type(e).__name__})
+        print(f"shadow: {kind} failed for {job_key}: {_sanitize_error(e)}", flush=True)
+        return False, None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _shadow_upsert_inbound(mid, record):
+    if get_sqlite_mode() == "json" or _SHADOW_MOD is None:
+        return
+    _shadow_guarded(
+        "shadow_inbound_failed", mid,
+        lambda conn: _SHADOW_MOD.upsert_inbound(
+            conn, str(mid), "received",
+            _SHADOW_MOD.record_sha256(record)))
+
+
+def _shadow_upsert_job_ready(name, job):
+    if get_sqlite_mode() == "json" or _SHADOW_MOD is None \
+            or not _shadow_tracked(name):
+        return
+    key = name[:-5] if name.endswith(".json") else name
+    _shadow_guarded(
+        "shadow_job_ready_failed", key,
+        lambda conn: _SHADOW_MOD.upsert_job_ready(
+            conn, key, _SHADOW_MOD.record_sha256(job)))
+
+
+def _shadow_mirror_segments(name, job):
+    if get_sqlite_mode() == "json" or _SHADOW_MOD is None \
+            or not _shadow_tracked(name):
+        return
+    key = name[:-5] if name.endswith(".json") else name
+    _shadow_guarded(
+        "shadow_segments_failed", key,
+        lambda conn: _SHADOW_MOD.upsert_job_segments(conn, key, job))
+
+
+def _shadow_lease_expired(lease_until):
+    """Expired means: no lease at all (an in-flight row without a
+    lease cannot prove it is still live), or a deadline at/before
+    now. Fail-safe toward human review, never toward resend."""
+    if lease_until is None:
+        return True
+    try:
+        from datetime import datetime, timezone
+        _text = str(lease_until)
+        if _text.endswith("Z"):
+            _text = _text[:-1] + "+00:00"
+        _until = datetime.fromisoformat(_text)
+        if _until.tzinfo is None:
+            _until = _until.replace(tzinfo=timezone.utc)
+        return _until <= datetime.now(timezone.utc)
+    except Exception:
+        return True
+
+
+def _shadow_first_seen(name, job):
+    """Drain first-seen shadow convergence (dual/shadow only).
+    Returns "proceed", "skip", "archived_sent", or "archived_failed".
+    Runs on EVERY drain pass for a pending job, not just the first:
+    row states are idempotent, so re-evaluation is safe. Terminal
+    shadow rows archive the JSON file here (never resend); in-flight
+    unexpired rows skip this pass; leased rows skip for manual
+    confirmation; a missing row is inserted as ready_to_send. A
+    first-seen failure never blocks: dual fails open, and in shadow
+    mode the send-start gate below is the fail-closed point."""
+    if get_sqlite_mode() == "json" or _SHADOW_MOD is None \
+            or not _shadow_tracked(name):
+        return "proceed"
+    key = name[:-5] if name.endswith(".json") else name
+    path = os.path.join(OUTBOX_PENDING, name)
+    ok, row = _shadow_guarded(
+        "shadow_first_seen_failed", key,
+        lambda conn: _SHADOW_MOD.get_job(conn, key))
+    if not ok:
+        return "proceed"
+    if row is None:
+        _shadow_upsert_job_ready(name, job)
+        _shadow_mirror_segments(name, job)
+        return "proceed"
+    state = row["state"]
+    if state in ("sent", "needs_check", "dead"):
+        # Startup-reconcile convergence, applied in drain too: the
+        # shadow already decided, so move the JSON file, never send.
+        job["terminal"] = True
+        if state == "sent":
+            job["delivery_state"] = "sent"
+        elif state == "needs_check":
+            job["delivery_state"] = "needs_check"
+            job["needs_check_reason"] = row.get("failure_code") or "shadow_terminal"
+            job["failure_code"] = row.get("failure_code")
+        else:
+            job["delivery_state"] = "failed"
+        try:
+            atomic_write_json(path, job, mode=0o600)
+        except Exception:
+            pass
+        _outcome, _ = _obs_job_outcome(job)
+        record_timeline_event(
+            name, "sent" if state == "sent" else (
+                "needs_check" if _outcome == "needs_check" else "failed"),
+            failure_code=_obs_failure_code_for_job(job),
+            source="drain_shadow_archive")
+        try:
+            os.replace(path, os.path.join(
+                OUTBOX_SENT if state == "sent" else OUTBOX_FAILED, name))
+            print(f"outbox: shadow terminal {state} {name} archived (no resend)", flush=True)
+            # The archive above mutated terminal flags, so refresh
+            # the row hash to the moved file (compare consistency).
+            _shadow_refresh_job_sha(name, job)
+        except OSError as e:
+            print(f"outbox: shadow archive move FAILED for {name}: {_sanitize_error(e)}; kept pending but terminal, will NOT resend", flush=True)
+        return "archived_sent" if state == "sent" else "archived_failed"
+    if state == "sending_in_flight":
+        if not _shadow_lease_expired(row.get("lease_until")):
+            _SEND_COOLDOWN[name] = time.time()
+            print(f"outbox: shadow in-flight {name} skipped this pass (lease live)", flush=True)
+            return "skip"
+        # Lease expired: iron law locks it to needs_check, never
+        # back to pending, never auto-resent.
+        _shadow_guarded(
+            "shadow_lease_lock_failed", key,
+            lambda conn: _SHADOW_MOD.transition_job(
+                conn, key, "needs_check",
+                failure_code="lease_expired_in_flight"))
+        job["delivery_state"] = "needs_check"
+        job["needs_check_reason"] = "lease_expired_in_flight"
+        job["failure_code"] = "lease_expired_in_flight"
+        job["terminal"] = True
+        try:
+            atomic_write_json(path, job, mode=0o600)
+        except Exception:
+            pass
+        record_timeline_event(name, "needs_check",
+                              failure_code="delivery_unknown",
+                              source="drain_shadow_lease")
+        try:
+            os.replace(path, os.path.join(OUTBOX_FAILED, name))
+            print(f"outbox: shadow lease expired {name} locked to needs_check (no resend)", flush=True)
+            _shadow_refresh_job_sha(name, job)
+        except OSError as e:
+            print(f"outbox: shadow lease move FAILED for {name}: {_sanitize_error(e)}; kept pending but terminal, will NOT resend", flush=True)
+        return "archived_failed"
+    if state == "leased_inferring":
+        # Claim state has no bridge-side disposition (design 4.4):
+        # skip for manual confirmation, never auto-move.
+        _SEND_COOLDOWN[name] = time.time()
+        print(f"outbox: shadow leased_inferring {name} skipped (manual confirmation required)", flush=True)
+        return "skip"
+    # ready_to_send: proceed (segments mirrored). pending: converged
+    # to ready by upsert_job_ready (see the deviation note above).
+    _shadow_upsert_job_ready(name, job)
+    _shadow_mirror_segments(name, job)
+    return "proceed"
+
+
+def _shadow_begin_send_gate(name, job):
+    """Send-start gate (design 1.4). Returns True if this pass may
+    call send functions for the job. Json mode and untracked jobs
+    always pass. Dual mode attempts the transition but never blocks
+    on failure (fail-open). Shadow mode blocks on ANY begin_send
+    failure: the job stays pending + 10s cooldown, never terminal,
+    never sent."""
+    if get_sqlite_mode() == "json" or _SHADOW_MOD is None \
+            or not _shadow_tracked(name):
+        return True
+    key = name[:-5] if name.endswith(".json") else name
+    ok, _row = _shadow_guarded(
+        "shadow_begin_send_failed", key,
+        lambda conn: _SHADOW_MOD.begin_send(conn, key))
+    if ok:
+        return True
+    if get_sqlite_mode() == "shadow":
+        _SEND_COOLDOWN[name] = time.time()
+        print(f"outbox: shadow begin-send failed for {name}, NOT sending (cooldown 10s)", flush=True)
+        return False
+    return True
+
+
+def _shadow_reset_for_retry(name):
+    """Retryable reset (parent decision 2026-11-01). After a drain
+    pass that kept the job pending on an explicitly-undelivered
+    Retryable failure, move the shadow row sending_in_flight ->
+    ready_to_send and clear its send lease, so the next drain can
+    begin_send again (JSON's immediate 3-attempt retry). Fail-open
+    in every mode: a reset failure only records a desensitized
+    marker (via _shadow_guarded) and never blocks the JSON-side
+    retry. Unknown / timeout / interrupt failures never reach here
+    (they go terminal -> mirror needs_check); terminal rows are
+    never touched (reset_for_retry refuses them). Segment rows are
+    descriptive mirrors only and are untouched by the reset; the
+    next drain's segment mirror refreshes them on proceed."""
+    if get_sqlite_mode() == "json" or _SHADOW_MOD is None \
+            or not _shadow_tracked(name):
+        return
+    key = name[:-5] if name.endswith(".json") else name
+    _shadow_guarded(
+        "shadow_reset_failed", key,
+        lambda conn: _SHADOW_MOD.reset_for_retry(conn, key))
+
+
+def _shadow_mirror_terminal(name, job, target_state, failure_code=None):
+    """Mirror a job-level terminal disposition (fail-open in every
+    mode: a mirror failure must never block an archive). Target
+    states: "sent", "needs_check", "dead". The job's current record
+    hash is stored too, so compare keeps matching the archived file
+    (the hash is over the token-scrubbed record, never the record
+    itself)."""
+    if get_sqlite_mode() == "json" or _SHADOW_MOD is None \
+            or not _shadow_tracked(name):
+        return
+    key = name[:-5] if name.endswith(".json") else name
+    _shadow_guarded(
+        "shadow_terminal_failed", key,
+        lambda conn: _SHADOW_MOD.mirror_job_terminal(
+            conn, key, target_state, failure_code,
+            _SHADOW_MOD.record_sha256(job)))
+
+
+def _shadow_refresh_job_sha(name, job):
+    """Refresh one job row's record hash after the bridge mutated
+    the JSON file's terminal flags around a move (first-seen
+    archive, lease lock, startup reconcile). State untouched,
+    fail-open, no-op in json mode or for untracked jobs."""
+    if get_sqlite_mode() == "json" or _SHADOW_MOD is None \
+            or not _shadow_tracked(name):
+        return
+    key = name[:-5] if name.endswith(".json") else name
+    _shadow_guarded(
+        "shadow_sha_failed", key,
+        lambda conn: _SHADOW_MOD.update_job_record_sha(
+            conn, key, _SHADOW_MOD.record_sha256(job)))
+
+
+def _shadow_startup_sync():
+    """Apply reconcile_on_startup moves (design 2.4). Runs after
+    recover_sending_on_startup, before new messages are taken.
+    Guarded, never raises. Json mode does nothing."""
+    if get_sqlite_mode() == "json" or _SHADOW_MOD is None:
+        return
+    ok, report = _shadow_guarded(
+        "shadow_reconcile_failed", "startup",
+        lambda conn: _SHADOW_MOD.reconcile_on_startup(
+            conn, _shadow_root()))
+    if not ok or not isinstance(report, dict):
+        return
+    for key in report.get("move_to_sent", []):
+        name = key + ".json"
+        if name in _IN_MEMORY_HALTED_FILES:
+            continue
+        path = os.path.join(OUTBOX_PENDING, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                job = json.load(f)
+        except Exception:
+            continue
+        job["terminal"] = True
+        job["delivery_state"] = "sent"
+        try:
+            atomic_write_json(path, job, mode=0o600)
+            os.replace(path, os.path.join(OUTBOX_SENT, name))
+            record_timeline_event(name, "sent", source="startup_shadow_reconcile")
+            print(f"outbox: startup reconcile moved {name} to sent/ (already delivered)", flush=True)
+            _shadow_refresh_job_sha(name, job)
+        except Exception as e:
+            print(f"outbox: startup reconcile move FAILED for {name}: {_sanitize_error(e)}", flush=True)
+    for item in report.get("move_to_failed", []):
+        key = item.get("job_key") if isinstance(item, dict) else item
+        state = item.get("state") if isinstance(item, dict) else "needs_check"
+        code = item.get("failure_code") if isinstance(item, dict) else None
+        name = key + ".json"
+        if name in _IN_MEMORY_HALTED_FILES:
+            continue
+        path = os.path.join(OUTBOX_PENDING, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                job = json.load(f)
+        except Exception:
+            continue
+        job["terminal"] = True
+        if state == "needs_check":
+            job["delivery_state"] = "needs_check"
+            job["needs_check_reason"] = code or "shadow_terminal"
+            job["failure_code"] = code
+        else:
+            job["delivery_state"] = "failed"
+        try:
+            atomic_write_json(path, job, mode=0o600)
+            os.replace(path, os.path.join(OUTBOX_FAILED, name))
+            _outcome, _ = _obs_job_outcome(job)
+            record_timeline_event(
+                name, "needs_check" if _outcome == "needs_check" else "failed",
+                failure_code=_obs_failure_code_for_job(job),
+                source="startup_shadow_reconcile")
+            print(f"outbox: startup reconcile moved {name} to failed/ (shadow {state})", flush=True)
+            _shadow_refresh_job_sha(name, job)
+        except Exception as e:
+            print(f"outbox: startup reconcile move FAILED for {name}: {_sanitize_error(e)}", flush=True)
+    _left = len(report.get("left_inflight", []))
+    _missing = len(report.get("missing_row", []))
+    if _left or _missing:
+        print(f"outbox: startup reconcile left {_left} in-flight (lease live), {_missing} without shadow row (report only)", flush=True)
+
+
+def _shadow_lease_tick():
+    """Lease recovery tick (U3: every 60s, from _sender_loop).
+    Only expired leases move, and only in shadow rows -- JSON files
+    for locked jobs are archived by drain first-seen. Guarded,
+    never raises. Prints only when something actually moved."""
+    global _SHADOW_LAST_LEASE_TICK
+    if get_sqlite_mode() == "json" or _SHADOW_MOD is None:
+        return
+    now = time.time()
+    if now - _SHADOW_LAST_LEASE_TICK < 60:
+        return
+    _SHADOW_LAST_LEASE_TICK = now
+    ok, report = _shadow_guarded(
+        "shadow_lease_failed", "lease_tick",
+        lambda conn: _SHADOW_MOD.recover_expired_leases(conn))
+    if ok and isinstance(report, dict) and (
+            report.get("recovered_to_pending") or report.get("locked_to_needs_check")):
+        print(f"outbox: shadow lease tick recovered {report['recovered_to_pending']} to pending, locked {report['locked_to_needs_check']} to needs_check", flush=True)
+
+
 def drain_outbox(session):
     """Send pending outbox files, each output item independently.
     Audit 3: text and each attachment have their own persisted ID,
@@ -4136,10 +6680,69 @@ def drain_outbox(session):
         path = os.path.join(OUTBOX_PENDING, name)
         try:
             with open(path, encoding="utf-8") as f:
-                job = json.load(f)
+                _raw = f.read()
+            job = json.loads(_raw)
         except (OSError, ValueError) as e:
             print(f"outbox: skipping unreadable {name}: {_sanitize_error(e)}", flush=True)
             continue
+        if not isinstance(job, dict):
+            # Gate 1 remainder (Worker permission tightening, strict
+            # additive check): a pending file that parses as JSON
+            # but is not an object can never be a valid task. Before
+            # this guard, the first job.get() below raised
+            # AttributeError, aborting this drain pass and starving
+            # every later-sorted job on every tick until the file
+            # was removed by hand. Park it as needs_check instead:
+            # never sent, never re-entered. The original bytes are
+            # preserved under failures/ for manual inspection; the
+            # failed/ record is a dict-shaped terminal record so
+            # the summary and the per-message view agree (needs_check).
+            _shape = type(job).__name__
+            _key = name[:-5] if name.endswith(".json") else name
+            _parked = {
+                "delivery_state": "needs_check",
+                "needs_check_reason": "job_not_object",
+                "terminal": True,
+                "original_job_type": _shape,
+            }
+            try:
+                atomic_write_text(
+                    os.path.join(FAILURES_DIR, f"{_key}_job_not_object.orig"),
+                    _raw, mode=0o600)
+            except Exception as _jo_e:
+                print(f"outbox: job-not-object evidence write failed for {name}: {_sanitize_error(_jo_e)}", flush=True)
+            try:
+                write_failure_record(
+                    _key, "job_not_object",
+                    {"kind": "job_not_object", "original_job_type": _shape})
+            except Exception as _jo_e2:
+                print(f"outbox: job-not-object marker write failed for {name}: {_sanitize_error(_jo_e2)}", flush=True)
+            _TERMINAL_TASK_IDS.add(name)
+            record_timeline_event(name, "needs_check", failure_code="job_not_object",
+                                  source="drain_job_shape")
+            try:
+                atomic_write_json(os.path.join(OUTBOX_FAILED, name), _parked, mode=0o600)
+                os.remove(path)
+                print(f"outbox: non-object job {name} parked to failed/ as needs_check (no send)", flush=True)
+            except OSError as _jo_e3:
+                print(f"outbox: non-object job {name} park FAILED: {_sanitize_error(_jo_e3)}; kept in pending, will re-park next drain, never sent", flush=True)
+            _shadow_mirror_terminal(name, _parked, "needs_check", "job_not_object")
+            failed_names.append(name)
+            continue
+        # Gate 1 item 2: Worker-written jobs (<message_id>.json)
+        # are written outside this code, so the bridge cannot
+        # timestamp that write; the first drain sighting is
+        # recorded instead (an upper bound on the queue time,
+        # source drain_first_seen). Bridge-written suffix jobs
+        # already recorded "queued" at their own write, so they
+        # are not re-recorded here. The reader takes the earliest
+        # event per stage, so a later sighting never overwrites
+        # an exact bridge_write time.
+        if name not in _OBS_QUEUED_SEEN:
+            _OBS_QUEUED_SEEN.add(name)
+            _qk = _obs_job_key(name)
+            if _qk is not None and _qk.isdigit():
+                record_timeline_event(name, "queued", source="drain_first_seen")
         # v1.0.1 + v1.0.2: a job already at a terminal status must
         # never be sent again, even if its earlier move to failed/
         # failed and it is still sitting in pending/. A terminal job
@@ -4156,11 +6759,39 @@ def drain_outbox(session):
         if name in _TERMINAL_TASK_IDS or _is_terminal_job(job):
             _TERMINAL_TASK_IDS.add(name)
             failed_names.append(name)
+            # Gate 1 item 2: a job already terminal on disk is
+            # archived, never resent; record its terminal outcome
+            # (the original failure was recorded, if at all, when
+            # it first became terminal; this event marks the
+            # archive moment with the same derived code).
+            _tb_outcome, _ = _obs_job_outcome(job)
+            # Gate 3 step 2: mirror the already-terminal disposition
+            # (kept_terminal when the row is already terminal).
+            _shadow_mirror_terminal(
+                name, job, "needs_check" if _tb_outcome == "needs_check" else "dead",
+                _obs_failure_code_for_job(job))
+            record_timeline_event(
+                name, "needs_check" if _tb_outcome == "needs_check" else "failed",
+                failure_code=_obs_failure_code_for_job(job), source="drain_terminal_archive")
             try:
                 os.replace(path, os.path.join(OUTBOX_FAILED, name))
                 print(f"outbox: terminal {name} archived to failed/ on retry (no resend)", flush=True)
             except OSError as e:
                 print(f"outbox: skipping terminal {name}, archive retry failed: {_sanitize_error(e)}; will NOT resend", flush=True)
+            continue
+        # Gate 3 step 2: shadow first-seen convergence (dual/shadow
+        # only; json mode returns "proceed" untouched). Terminal
+        # shadow rows archive the JSON file here, never resend;
+        # in-flight unexpired rows skip this pass; leased rows
+        # skip for manual confirmation.
+        _shadow_seen = _shadow_first_seen(name, job)
+        if _shadow_seen == "skip":
+            continue
+        if _shadow_seen == "archived_sent":
+            sent_names.append(name)
+            continue
+        if _shadow_seen == "archived_failed":
+            failed_names.append(name)
             continue
         attachments = []
         if isinstance(job.get("attachments"), list):
@@ -4172,13 +6803,82 @@ def drain_outbox(session):
         if not text and not attachments:
             continue
         changed = False
+        # Retryable-reset flag (parent decision 2026-11-01): set by
+        # any send branch below when a failure classifies Retryable
+        # AND still has attempts left (status still "pending").
+        # The keep-pending branch at the end of this pass resets
+        # the shadow row only when this flag is set; Unknown /
+        # timeout failures go terminal and never set it.
+        _retryable_this_pass = False
         # Fix 2026-10-28: Worker writes pending with to_user_id from
         # session.json, but that file's key is ilink_user_id, not
         # to_user_id, so pending can arrive with to_user_id null.
-        # Fill it here so the sent file is not left with null recipient.
-        if not job.get("to_user_id") and session.get("ilink_user_id"):
-            job["to_user_id"] = session.get("ilink_user_id")
-            changed = True
+        # R1 gate (2026-11-01, cross-root miswrite protection):
+        # a recipient-less task is NO LONGER filled unconditionally.
+        # Fill it only when this root holds a receipt record for
+        # the task's message id (inbox/ or done/): that proves the
+        # task belongs to a message this root actually received,
+        # so legacy compat is fully preserved. A recipient-less
+        # task with NO local receipt record has the exact shape of
+        # a task miswritten here from another root: never send it
+        # under this root's account, park it for manual check
+        # instead (mirrors the recipient_mismatch park below, and
+        # re-fires on every drain). This is deliberately NOT a
+        # blanket rejection of recipient-less tasks: whether the
+        # current Worker writes to_user_id on every task is
+        # unproven (sent archives may be scrub-rewritten versions,
+        # not Worker originals), so a blanket rejection could
+        # stall normal replies in needs_check.
+        if not job.get("to_user_id"):
+            _gate_mid = name[:-5] if name.endswith(".json") else name
+            for _gate_suffix in ("_local_deleted", "_local_answer",
+                                 "_voice_prompt", "_local_del",
+                                 "_local_keep", "_local_fail",
+                                 "_progress", "_offline", "_queue",
+                                 "_fast", "_local"):
+                if _gate_mid.endswith(_gate_suffix):
+                    _gate_mid = _gate_mid[: -len(_gate_suffix)]
+                    break
+            _gate_local = (
+                os.path.isfile(os.path.join(INBOX, _gate_mid + ".json"))
+                or os.path.isfile(os.path.join(DONE, _gate_mid + ".json"))
+            )
+            if _gate_local and session.get("ilink_user_id"):
+                job["to_user_id"] = session.get("ilink_user_id")
+                changed = True
+            elif not _gate_local:
+                try:
+                    write_failure_record(
+                        _gate_mid,
+                        "recipient_missing",
+                        {"kind": "recipient_missing",
+                         "reason": "recipient_missing"})
+                except Exception as _rm_e:
+                    print(f"outbox: recipient-missing marker write failed for {name}: {_sanitize_error(_rm_e)}", flush=True)
+                job["delivery_state"] = "needs_check"
+                job["needs_check_reason"] = "recipient_missing"
+                job["terminal"] = True
+                _TERMINAL_TASK_IDS.add(name)
+                try:
+                    atomic_write_json(path, job, mode=0o600)
+                except Exception as _rm_e2:
+                    print(f"outbox: recipient-missing flag write failed for {name}: {_sanitize_error(_rm_e2)}", flush=True)
+                # Gate 1 item 2: parked for manual check, never sent.
+                record_timeline_event(name, "needs_check", failure_code="recipient_missing",
+                                      source="drain_recipient_gate")
+                try:
+                    os.replace(path, os.path.join(OUTBOX_FAILED, name))
+                    print(f"outbox: recipient missing {name} parked to failed/ (no send)", flush=True)
+                except OSError as _rm_e3:
+                    print(f"outbox: recipient-missing move FAILED for {name}: {_sanitize_error(_rm_e3)}; kept in pending but marked terminal, will NOT resend", flush=True)
+                # Gate 3 step 2: mirror the pre-send terminal
+                # disposition (never downgrades a terminal row).
+                _shadow_mirror_terminal(name, job, "needs_check", "recipient_missing")
+                failed_names.append(name)
+                continue
+            # else: local record exists but the session has no user
+            # id; leave unfilled. The send functions fail closed
+            # below exactly as before (no behavior change here).
         # GPT review 2026-10-31 (user decision: keep fallback, document
         # tradeoff): a pending job may carry a to_user_id from an older
         # login. Never send it under a different bound account: park it
@@ -4194,13 +6894,157 @@ def drain_outbox(session):
                 atomic_write_json(path, job, mode=0o600)
             except Exception as _mm_e:
                 print(f"outbox: recipient-mismatch flag write failed for {name}: {_sanitize_error(_mm_e)}", flush=True)
+            # Gate 1 item 2: parked for manual check, never sent.
+            record_timeline_event(name, "needs_check", failure_code="recipient_mismatch",
+                                  source="drain_recipient_check")
             try:
                 os.replace(path, os.path.join(OUTBOX_FAILED, name))
                 print(f"outbox: recipient mismatch {name} parked to failed/ (no send)", flush=True)
             except OSError as _mm_e2:
                 print(f"outbox: recipient-mismatch move FAILED for {name}: {_sanitize_error(_mm_e2)}; kept in pending but marked terminal, will NOT resend", flush=True)
+            # Gate 3 step 2: mirror the pre-send terminal disposition.
+            _shadow_mirror_terminal(name, job, "needs_check", "recipient_mismatch")
             failed_names.append(name)
             continue
+        # Gate 1 item 1 (outbound sanitize, 2026-10-31): strip
+        # widget tags BEFORE any send, and never send a blank
+        # bubble. This runs after the recipient check (which must
+        # stay first) and before plan building / single-send, so:
+        # - a fresh long text is sanitized first, then segmented:
+        #   segment count and splice restore hold for the
+        #   sanitized text, and no widget tag can survive in a part;
+        # - an existing plan is NOT resliced and its top-level
+        #   text is NOT rewritten (the top level is history, and
+        #   reslicing a plan with sent parts would go needs_check):
+        #   only the display_text of still-pending/blocked parts
+        #   is sanitized, every drain, so a manually resent part
+        #   is re-checked too. A pending/blocked part whose
+        #   sanitized display carries no content becomes
+        #   'skipped_empty' (never sent, never renumbered: labels
+        #   stay as built, so a skipped part leaves a visible
+        #   label gap such as [1/3] then [3/3] rather than a
+        #   silently renumbered plan that would break index
+        #   mapping; resend-text-part refuses skipped_empty parts,
+        #   so they cannot be sent back by hand either).
+        # - a job whose text sanitizes to empty is handled here:
+        #   with no attachments it is archived to failed/ as a
+        #   terminal skipped_empty job (never sent); with
+        #   attachments it proceeds with text skipped and only
+        #   the attachments sent. The failures/ marker carries
+        #   lengths and reason only, never text or any token.
+        _sanitize_existing_plan = _text_plan(job)
+        _sanitize_orig_len = len(text) if isinstance(text, str) else 0
+        if _sanitize_existing_plan is not None:
+            for _sp in _sanitize_existing_plan:
+                if not isinstance(_sp, dict):
+                    continue
+                if _sp.get("status") not in ("pending", "blocked_by_prior"):
+                    continue
+                _old_disp = _sp.get("display_text")
+                if not isinstance(_old_disp, str):
+                    continue
+                _new_disp = sanitize_outbound_text(_old_disp)
+                if _new_disp != _old_disp:
+                    _sp["display_text"] = _new_disp
+                    changed = True
+                if _sanitized_part_is_empty(_new_disp):
+                    _sp["status"] = "skipped_empty"
+                    _sp["error_code"] = None
+                    changed = True
+            _sanitize_all_parts_skipped = bool(_sanitize_existing_plan) and all(
+                isinstance(_sp, dict) and _sp.get("status") == "skipped_empty"
+                for _sp in _sanitize_existing_plan)
+            if _sanitize_all_parts_skipped and not attachments:
+                _sanitized_top = sanitize_outbound_text(text) if isinstance(text, str) else ""
+                try:
+                    write_failure_record(
+                        name[:-5] if name.endswith(".json") else name,
+                        "outbound_sanitize",
+                        {"kind": "skipped_empty", "reason": "skipped_empty",
+                         "original_len": _sanitize_orig_len,
+                         "sanitized_len": len(_sanitized_top),
+                         "sanitized_stripped_len": len(_sanitized_top.strip()),
+                         "parts_skipped": len(_sanitize_existing_plan)})
+                except Exception as _sk_e:
+                    print(f"outbox: skipped-empty marker write failed for {name}: {_sanitize_error(_sk_e)}", flush=True)
+                job["text_status"] = "skipped_empty"
+                job["delivery_state"] = "skipped_empty"
+                job["terminal"] = True
+                _TERMINAL_TASK_IDS.add(name)
+                try:
+                    atomic_write_json(path, job, mode=0o600)
+                except Exception as _sk_e2:
+                    print(f"outbox: skipped-empty flag write failed for {name}: {_sanitize_error(_sk_e2)}", flush=True)
+                # Gate 1 item 2: sanitized-empty, never sent.
+                record_timeline_event(name, "skipped_empty", failure_code="skipped_empty",
+                                      source="drain_sanitize")
+                try:
+                    os.replace(path, os.path.join(OUTBOX_FAILED, name))
+                    print(f"outbox: skipped empty text (plan) {name} archived to failed/ (no send)", flush=True)
+                except OSError as _sk_e3:
+                    print(f"outbox: skipped-empty move FAILED for {name}: {_sanitize_error(_sk_e3)}; kept in pending but marked terminal, will NOT resend", flush=True)
+                # Gate 3 step 2: skipped_empty is a permanent
+                # non-send (dead in the shadow mapping).
+                _shadow_mirror_terminal(name, job, "dead", "skipped_empty")
+                failed_names.append(name)
+                continue
+        elif isinstance(text, str) and _sanitize_orig_len > 0:
+            _sanitized_text = sanitize_outbound_text(text)
+            if _sanitized_text != text:
+                text = _sanitized_text
+                job["text"] = _sanitized_text
+                changed = True
+            if text.strip() == "":
+                if not attachments:
+                    try:
+                        write_failure_record(
+                            name[:-5] if name.endswith(".json") else name,
+                            "outbound_sanitize",
+                            {"kind": "skipped_empty", "reason": "skipped_empty",
+                             "original_len": _sanitize_orig_len,
+                             "sanitized_len": len(_sanitized_text),
+                             "sanitized_stripped_len": len(_sanitized_text.strip())})
+                    except Exception as _sk_e:
+                        print(f"outbox: skipped-empty marker write failed for {name}: {_sanitize_error(_sk_e)}", flush=True)
+                    job["text_status"] = "skipped_empty"
+                    job["delivery_state"] = "skipped_empty"
+                    job["terminal"] = True
+                    _TERMINAL_TASK_IDS.add(name)
+                    try:
+                        atomic_write_json(path, job, mode=0o600)
+                    except Exception as _sk_e2:
+                        print(f"outbox: skipped-empty flag write failed for {name}: {_sanitize_error(_sk_e2)}", flush=True)
+                    # Gate 1 item 2: sanitized-empty, never sent.
+                    record_timeline_event(name, "skipped_empty", failure_code="skipped_empty",
+                                          source="drain_sanitize")
+                    try:
+                        os.replace(path, os.path.join(OUTBOX_FAILED, name))
+                        print(f"outbox: skipped empty text {name} archived to failed/ (no send)", flush=True)
+                    except OSError as _sk_e3:
+                        print(f"outbox: skipped-empty move FAILED for {name}: {_sanitize_error(_sk_e3)}; kept in pending but marked terminal, will NOT resend", flush=True)
+                    # Gate 3 step 2: mirror the permanent non-send.
+                    _shadow_mirror_terminal(name, job, "dead", "skipped_empty")
+                    failed_names.append(name)
+                    continue
+                # Empty text with attachments: text is already ""
+                # here, so the legacy single-send branch (which
+                # requires a truthy text) is skipped, _text_sent
+                # treats empty text as resolved, and only the
+                # attachments are sent below. Record the skip.
+                job["text_status"] = "skipped_empty"
+                # Gate 1 item 2: text skipped, attachments proceed.
+                record_timeline_event(name, "skipped_empty", failure_code="skipped_empty",
+                                      source="drain_sanitize")
+                try:
+                    write_failure_record(
+                        name[:-5] if name.endswith(".json") else name,
+                        "outbound_sanitize",
+                        {"kind": "skipped_empty", "reason": "skipped_empty",
+                         "original_len": _sanitize_orig_len,
+                         "sanitized_len": len(_sanitized_text),
+                         "sanitized_stripped_len": len(_sanitized_text.strip())})
+                except Exception as _sk_e:
+                    print(f"outbox: skipped-empty marker write failed for {name}: {_sanitize_error(_sk_e)}", flush=True)
         # R2 P0 (B2-lite): the bridge session owns context_token.
         # A pending job may still carry a Worker-copied token from
         # the old contract; prefer the live session token and fall
@@ -4289,14 +7133,18 @@ def drain_outbox(session):
                 _pstatus = _part.get("status")
                 if _pstatus == "blocked_by_prior":
                     # Tail resumes only once every earlier part is
-                    # sent; otherwise it stays blocked.
-                    if all(isinstance(p, dict) and p.get("status") == "sent" for p in _plan[:_part.get("index", 0)]):
+                    # sent (or sanitizer-skipped); otherwise it stays
+                    # blocked.
+                    if all(isinstance(p, dict) and p.get("status") in ("sent", "skipped_empty") for p in _plan[:_part.get("index", 0)]):
                         _part["status"] = "pending"
                         _pstatus = "pending"
                         changed = True
                     else:
                         continue
-                if _pstatus == "sent":
+                if _pstatus in ("sent", "skipped_empty"):
+                    # Gate 1 item 1: a sanitizer-skipped part is
+                    # resolved like a sent part: never sent, never
+                    # blocking later parts or attachments.
                     continue
                 if _pstatus in ("failed", "needs_check"):
                     _part_bad = True
@@ -4340,6 +7188,7 @@ def drain_outbox(session):
                             _part["status"] = "pending"
                             _part["error_code"] = "retryable"
                             _part_retry = True
+                            _retryable_this_pass = True
                     else:
                         _part["status"] = _status
                         _part["error_code"] = "permanent" if _status == "failed" else "unknown_delivery"
@@ -4373,8 +7222,16 @@ def drain_outbox(session):
                     # part in order; do NOT break on success.
             if _plan_halted:
                 continue
-            if all(isinstance(p, dict) and p.get("status") == "sent" for p in _plan):
-                job["text_status"] = "sent"
+            if all(isinstance(p, dict) and p.get("status") in ("sent", "skipped_empty") for p in _plan):
+                # Gate 1 item 1: "sent" here means every sendable
+                # part was sent; skipped_empty parts are excluded
+                # from that claim. If no part was actually sent
+                # (all skipped), the text itself was skipped, not
+                # sent, and attachments below still proceed.
+                if all(isinstance(p, dict) and p.get("status") == "skipped_empty" for p in _plan):
+                    job["text_status"] = "skipped_empty"
+                else:
+                    job["text_status"] = "sent"
                 changed = True
             elif _part_bad:
                 for _p in _plan:
@@ -4395,6 +7252,33 @@ def drain_outbox(session):
                 # still pending: later parts and attachments wait.
                 _plan_blocked = True
         if _plan_halted:
+            continue
+        # Gate 3 step 2: send-start gate. Only when this pass will
+        # actually attempt a send: in shadow mode the
+        # ready_to_send -> sending_in_flight transition must succeed
+        # first, or nothing is sent this pass (job stays pending +
+        # 10s cooldown, never terminal); in dual mode a failed
+        # transition is fail-open (JSON decision stands). Blocked
+        # jobs (plan blocked, nothing sendable) skip the gate and
+        # reach the terminal/keep logic below untouched.
+        _will_send = False
+        if _plan is not None and not _plan_blocked:
+            for _p in _plan:
+                if not isinstance(_p, dict):
+                    continue
+                if _p.get("status") == "pending":
+                    _will_send = True
+                    break
+                if _p.get("status") == "blocked_by_prior" and all(
+                        isinstance(q, dict) and q.get("status") in ("sent", "skipped_empty")
+                        for q in _plan[:_p.get("index", 0)]):
+                    _will_send = True
+                    break
+        if _plan is None and not _plan_blocked and text and job.get("text_status") not in ("sent", "failed", "needs_check"):
+            _will_send = True
+        if not _plan_blocked and any(isinstance(a, dict) and a.get("status") == "pending" for a in attachments):
+            _will_send = True
+        if _will_send and not _shadow_begin_send_gate(name, job):
             continue
         # Text item. v1.0.2 sub-item interception: a failed/needs_check
         # text item is terminal on its own, even when other items in
@@ -4429,6 +7313,20 @@ def drain_outbox(session):
                     if job["text_attempts"] >= 3:
                         job["text_status"] = "failed"
                         job["delivery_state"] = "failed"
+                # Gate 1 item 2: keep the delivery classification
+                # drain already computed, as a stable code on the
+                # job. Without this, a legacy text failure would
+                # only leave text_status + free-form error text,
+                # and the observability code would have to guess
+                # between permanent / retryable / unknown.
+                _tcode = {"failed": "send_permanent", "pending": "send_retryable",
+                          "needs_check": "send_unknown"}.get(status)
+                if status == "pending" and job.get("text_attempts", 0) >= 3:
+                    _tcode = "send_retry_limit"
+                if _tcode is not None:
+                    job["text_error_code"] = _tcode
+                if job.get("text_status") == "pending":
+                    _retryable_this_pass = True
                 changed = True
                 print(f"outbox: text {status} for {name}: {_sanitize_error(e)}", flush=True)
         # Attachment items, each with its persisted client_id.
@@ -4440,7 +7338,7 @@ def drain_outbox(session):
             if not isinstance(att, dict):
                 continue
             if att.get("status") == "blocked_by_prior" and _plan is not None and all(
-                    isinstance(p, dict) and p.get("status") == "sent" for p in _plan):
+                    isinstance(p, dict) and p.get("status") in ("sent", "skipped_empty") for p in _plan):
                 att["status"] = "pending"
                 changed = True
             # v1.0.2 sub-item interception, same rule as text above.
@@ -4488,6 +7386,16 @@ def drain_outbox(session):
                     att["attempts"] = int(att.get("attempts", 0)) + 1
                     if att["attempts"] >= 3:
                         att["status"] = "failed"
+                # Gate 1 item 2: same stable-code rule as the
+                # text branch above (see there for why).
+                _acode = {"failed": "send_permanent", "pending": "send_retryable",
+                          "needs_check": "send_unknown"}.get(status)
+                if status == "pending" and att.get("attempts", 0) >= 3:
+                    _acode = "send_retry_limit"
+                if _acode is not None:
+                    att["error_code"] = _acode
+                if att.get("status") == "pending":
+                    _retryable_this_pass = True
                 changed = True
                 print(f"outbox: {att.get('type') or 'image'} {status} for {name}: {_sanitize_error(e)}", flush=True)
         if attachments:
@@ -4497,7 +7405,13 @@ def drain_outbox(session):
         # by the part loop in that case, but check the parts
         # directly so a stale text_status cannot fake all_sent.
         if _plan is not None:
-            _text_sent = all(isinstance(p, dict) and p.get("status") == "sent" for p in _plan)
+            # Gate 1 item 1: skipped_empty parts count as resolved
+            # here (their all-skipped, no-attachment case was
+            # already archived before the plan loop, so reaching
+            # here with all skipped means attachments decided the
+            # outcome, and the text_status set above stays
+            # 'skipped_empty', never rewritten to 'sent').
+            _text_sent = all(isinstance(p, dict) and p.get("status") in ("sent", "skipped_empty") for p in _plan)
         else:
             _text_sent = (not text or job.get("text_status") == "sent")
         all_sent = _text_sent and all(
@@ -4551,6 +7465,26 @@ def drain_outbox(session):
         # archived record is never mistaken for clean.
         _scrub_job_token(path, job)
         if all_sent:
+            # Item: evidence audit. Only a job that reached the
+            # sent terminal state is audited, once, here: for a
+            # segmented long-text job all_sent is true only after
+            # every part and every attachment is sent, so a plan
+            # job is audited once, never once per part. Audit
+            # failure never blocks archiving: write_evidence_audit
+            # never raises, and this guard swallows even that.
+            try:
+                write_evidence_audit(name, job.get("text"))
+            except Exception as _audit_e:
+                print(f"outbox: evidence audit skipped for {name}: {_sanitize_error(_audit_e)}", flush=True)
+            # Gate 1 item 2: terminal sent moment, once per job
+            # (plan jobs reach here only after every part and
+            # every attachment is sent, like the audit above).
+            # Gate 3 step 2: shadow terminal FIRST (fail-open in
+            # every mode: a mirror failure must never block an
+            # already-sent job's archive), then the JSON move.
+            _shadow_mirror_terminal(name, job, "sent")
+            _shadow_mirror_segments(name, job)
+            record_timeline_event(name, "sent", source="drain_archive")
             os.replace(path, os.path.join(OUTBOX_SENT, name))
             sent_names.append(name)
             print(f"outbox: sent {name}", flush=True)
@@ -4567,6 +7501,17 @@ def drain_outbox(session):
                 atomic_write_json(path, job, mode=0o600)
             except Exception as e:
                 print(f"outbox: terminal flag write failed for {name}: {_sanitize_error(e)}", flush=True)
+            # Gate 1 item 2: terminal failed/needs_check moment
+            # with the stable code derived from the job itself.
+            _tf_outcome, _ = _obs_job_outcome(job)
+            # Gate 3 step 2: shadow terminal before the JSON move.
+            _shadow_mirror_terminal(
+                name, job, "needs_check" if _tf_outcome == "needs_check" else "dead",
+                _obs_failure_code_for_job(job))
+            _shadow_mirror_segments(name, job)
+            record_timeline_event(
+                name, "needs_check" if _tf_outcome == "needs_check" else "failed",
+                failure_code=_obs_failure_code_for_job(job), source="drain_terminal_archive")
             try:
                 os.replace(path, os.path.join(OUTBOX_FAILED, name))
                 print(f"outbox: needs_check/failed {name} (moved to failed/, no auto-retry for unknown)", flush=True)
@@ -4574,6 +7519,15 @@ def drain_outbox(session):
                 print(f"outbox: failed move FAILED for {name}: {_sanitize_error(e)}; kept in pending but marked terminal, will NOT resend", flush=True)
             failed_names.append(name)
         else:
+            # Retryable reset (parent decision 2026-11-01): this
+            # pass kept the job pending on an explicitly-undelivered
+            # Retryable failure, so reset the shadow row to
+            # ready_to_send (lease cleared) for the next drain.
+            # Unknown / timeout failures never reach here (they
+            # went terminal above); a reset failure only records a
+            # desensitized marker and never blocks this retry.
+            if _retryable_this_pass:
+                _shadow_reset_for_retry(name)
             failed_names.append(name)
             print(f"outbox: keeping {name} in pending (retryable, retry next loop)", flush=True)
     return sent_names, failed_names
@@ -4598,6 +7552,49 @@ def _sender_loop(session, stop_event, sent_queue):
         try:
             with _OUTBOX_LOCK:
                 sent_names, failed_names = drain_outbox(session)
+                # Gate 1 item 3: after draining, a formal job that
+                # only just arrived has been sent and suppresses
+                # its progress note; a message still without a
+                # formal job past 5s gets exactly one note. The
+                # call never raises and never blocks sending.
+                # Gate 1 item 4 (grace revision): offline
+                # receipts run first so a message that just
+                # earned one is suppressed from progress in the
+                # same tick; progress self-guards per message on
+                # offline ack/job too, so the order is defense
+                # in depth, not the only guard.
+                # Gate 2 same-source merge: promote due staged
+                # groups BEFORE offline/progress evaluate, so a
+                # just-promoted record gets a fresh received event
+                # and cannot earn a spurious receipt in this tick.
+                # Completions run after drain, so a formal job
+                # archived in this tick can complete its group.
+                # Both helpers never raise; the guards are belts
+                # and braces, like the receipt calls.
+                try:
+                    maybe_promote_merge_groups()
+                except Exception:
+                    pass
+                try:
+                    maybe_send_offline_receipts(session)
+                except Exception:
+                    pass
+                try:
+                    maybe_send_progress_receipts(session)
+                except Exception:
+                    pass
+                try:
+                    maybe_record_merge_completions()
+                except Exception:
+                    pass
+                # Gate 3 step 2: lease recovery tick (U3: every
+                # 60s, guarded; only expired leases move, and only
+                # in shadow rows -- JSON files for locked jobs are
+                # archived by drain first-seen).
+                try:
+                    _shadow_lease_tick()
+                except Exception:
+                    pass
             for _n in sent_names + failed_names:
                 try:
                     sent_queue.put(_n, timeout=0.1)
@@ -4677,8 +7674,31 @@ def serve_loop():
         atomic_write_text(os.path.join(STATE, "serve.pid"), f"{os.getpid()}\n", mode=0o600)
     except Exception:
         pass
+    # Gate 3 step 2: read the authority mode BEFORE any recovery or
+    # promotion touches shadow state; a running mode change needs a
+    # restart (design 2.1). Never raises (refresh falls back to json).
+    try:
+        refresh_sqlite_authority()
+    except Exception:
+        pass
     # Audit 3: recover any sending-state left by a crashed previous serve.
     recover_sending_on_startup()
+    # Gate 3 step 2: startup reconciliation (design 2.4): shadow
+    # decisions already made are applied to JSON files here, before
+    # new messages are taken. Guarded, never raises.
+    try:
+        _shadow_startup_sync()
+    except Exception:
+        pass
+    # Gate 2 same-source merge: promote staged groups left by a
+    # crashed previous serve (expired groups merge, unexpired
+    # ones wait for the sender thread's 1s tick). With the switch
+    # OFF, staged records are promoted verbatim, never stranded.
+    # Never raises.
+    try:
+        maybe_promote_merge_groups()
+    except Exception:
+        pass
     # R8: start independent sender thread before the poll loop.
     import queue as _queue_mod
     import threading as _thread_mod
@@ -4819,10 +7839,19 @@ def serve_loop():
             )
             check_ret(resp, "getupdates")
             _record_channel_status(True)
-        except TokenExpired:
+        except TokenExpired as e:
+            # Gate 2 -14 counting: the -14 stop itself is unchanged
+            # (NEEDS_RELOGIN already written by check_ret/post_json,
+            # no retry); only a desensitised category count is added.
+            _cat, _det = classify_getupdates_error(e)
+            record_getupdates_anomaly(_cat, _det)
             print("serve: token expired (-14), wrote NEEDS_RELOGIN, stopping.", flush=True)
             return 14
         except Exception as e:
+            # Gate 2 -14 counting: bucket the poll failure, then the
+            # existing backoff path runs unchanged (5s sleep, continue).
+            _cat, _det = classify_getupdates_error(e)
+            record_getupdates_anomaly(_cat, _det)
             # v1.0.2: post_json now carries curl_err + urllib_err +
             # desensitized target/proxy; sanitise again as defence in depth.
             _record_channel_status(False, _sanitize_error(e))
@@ -5135,6 +8164,7 @@ def serve_loop():
             # never blocks the main loop; decrypt failure never saves
             # ciphertext as plaintext; partial success proceeds.
             saved_files = []
+            saved_file_indices = []
             file_errors = []
             file_deadline = time.time() + FILE_MESSAGE_BUDGET_SECONDS
             file_plain_total = 0
@@ -5150,10 +8180,20 @@ def serve_loop():
                     saved, err, diag = None, _sanitize_error(e), None
                 if saved:
                     saved_files.append(saved)
+                    saved_file_indices.append(orig_idx)
                     file_plain_total += saved["size"]
                 else:
                     file_errors.append({"index": orig_idx, "error": err,
                                         "error_code": (diag or {}).get("error_code")})
+            # Gate 3 item 2 wiring: auto-parse each landed file. Parse
+            # never blocks receipt: failures leave failure evidence and
+            # the message still reaches the Worker below. The local-only
+            # refusal branch returns above, so it never reaches here.
+            for _saved, _idx in zip(saved_files, saved_file_indices):
+                try:
+                    maybe_parse_inbound_doc(_saved, _idx)
+                except Exception:
+                    pass
             if file_items and not saved_files and not text and not saved_images and not saved_videos:
                 # All files failed and nothing else to queue: explicit
                 # prompt, no inbox. (If images/videos were also saved,
@@ -5271,36 +8311,70 @@ def serve_loop():
                             "status": "unavailable",
                             "reason": _ev.get("reason") or _ev.get("status"),
                         }
-            try:
-                atomic_write_json(os.path.join(INBOX, f"{mid}.json"), record, mode=0o600)
-            except Exception as _inbox_e:
-                _batch_enqueue_failed = True
-                print(f"serve: inbox write FAILED for {mid}: {_sanitize_error(_inbox_e)}, NOT marking processed, will retry", flush=True)
-                continue
-            processed.add(mid); save_processed(processed)
-            _log_ts(f"serve: queued inbox/{mid}.json")
-            # Phase 2 step 3: typing + one queue notice only.
+            # Gate 2 same-source merge: with the switch ON, a normal
+            # Worker-bound message is staged bridge-privately instead
+            # of written to inbox (local-only placeholders bypass
+            # staging and keep the old path exactly). The timeline
+            # "received" event is recorded at promotion, when the
+            # Worker can first see the record.
+            _use_staging = (not is_local_only) and read_same_source_merge_mode()
+            _staged_first = False
+            if _use_staging:
+                _staged_ok, _staged_first = stage_merge_message(
+                    mid, msg.get("from_user_id"), record, ctx)
+                if not _staged_ok:
+                    _batch_enqueue_failed = True
+                    print(f"serve: merge staging FAILED for {mid}, NOT marking processed, will retry", flush=True)
+                    continue
+                processed.add(mid); save_processed(processed)
+                _log_ts(f"serve: staged merge/{mid}.json")
+            else:
+                try:
+                    atomic_write_json(os.path.join(INBOX, f"{mid}.json"), record, mode=0o600)
+                except Exception as _inbox_e:
+                    _batch_enqueue_failed = True
+                    print(f"serve: inbox write FAILED for {mid}: {_sanitize_error(_inbox_e)}, NOT marking processed, will retry", flush=True)
+                    continue
+                processed.add(mid); save_processed(processed)
+                # Gate 1 item 2: the inbox write above is durable, so
+                # this is the exact received moment for this message.
+                record_timeline_event(f"{mid}.json", "received", source="serve_inbox_write")
+                # Gate 3 step 2: shadow inbound mirror (dual/shadow
+                # only; json mode is a no-op). Hash only, never the
+                # record itself.
+                _shadow_upsert_inbound(mid, record)
+                _log_ts(f"serve: queued inbox/{mid}.json")
+            # Phase 2 step 3: typing only. The queue notice was
+            # removed by the waiting-prompt merge (2026-11-01):
+            # the progress receipt is the single waiting prompt.
             # Do NOT claim Muse has started executing before Worker runs.
-            try:
-                ticket = get_typing_ticket(session)
-                if ticket:
-                    with _TYPING_LOCK:
-                        _TYPING_MAP[mid] = ticket
-                    send_typing(session, ticket, 1,
-                                to_user_id=session.get("ilink_user_id"),
-                                context_token=ctx)
-            except TokenExpired:
-                print("serve: token expired during typing, stopping.", flush=True)
-                return 14
-            except Exception:
-                pass
-            try:
-                send_direct_or_outbox(session, next_queue_notice(),
-                                      session.get("ilink_user_id"), ctx,
-                                      f"{mid}_queue.json")
-            except TokenExpired:
-                print("serve: token expired during queue notice, stopping.", flush=True)
-                return 14
+            # Merge typing rule: only the group's first message gets
+            # a ticket (it becomes the anchor, whose formal job
+            # cancels it); followers get none, so no ticket leaks
+            # for messages that never get their own formal job.
+            if (not _use_staging) or _staged_first:
+                try:
+                    ticket = get_typing_ticket(session)
+                    if ticket:
+                        with _TYPING_LOCK:
+                            _TYPING_MAP[mid] = ticket
+                        send_typing(session, ticket, 1,
+                                    to_user_id=session.get("ilink_user_id"),
+                                    context_token=ctx)
+                except TokenExpired:
+                    print("serve: token expired during typing, stopping.", flush=True)
+                    return 14
+                except Exception:
+                    pass
+            # Waiting-prompt merge (2026-11-01): no queue notice
+            # is written here anymore. The progress receipt (Gate 1
+            # item 3) is the single waiting prompt: fast messages
+            # get only the formal reply, slow messages get
+            # progress + formal. The queue-notice helper is kept,
+            # unused, so restoring the old notice is a one-call
+            # revert. Note: removing this call also removes one
+            # early token-expiry exit; expiry still surfaces on
+            # the next real send (progress, formal, local).
         # R2: only now, after the whole batch, advance the cursor
         # and persist the last context_token. A crash before this
         # point re-fetches the batch; processed messages deduplicate.
@@ -5578,6 +8652,223 @@ def cmd_status(_args):
     return 0
 
 
+def _serve_alive():
+    """Read-only serve liveness: (pid_or_None, alive_bool). Never raises.
+
+    Same checks as the watchdog (serve.pid + /proc cmdline), but only
+    for reporting: this never restarts, never writes, never sends.
+    """
+    try:
+        with open(os.path.join(STATE, "serve.pid"), encoding="utf-8") as f:
+            pid = int(f.read().strip())
+    except Exception:
+        return None, False
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = f.read().replace(b"\x00", b" ").decode(errors="ignore")
+        if "bridge.py" not in cmdline or "serve" not in cmdline:
+            return pid, False
+        os.kill(pid, 0)
+        return pid, True
+    except Exception:
+        return pid, False
+
+
+def get_bridge_health():
+    """Desensitised bridge health snapshot. Read-only, never raises.
+
+    Only booleans, counts and fixed short strings are returned: never
+    job text, never tokens, never URLs, never user identifiers, never
+    run ids. Exit code of the `health` command is always 0: a dead
+    serve is a finding in the output, not a CLI failure, so callers
+    must read serve_alive / channel_recovered instead of the code.
+    """
+    out = {
+        "schema": "bridge-health-0.1",
+        "serve_alive": False,
+        "serve_pid": None,
+        "channel_recovered": False,
+        "channel_reason": "unknown",
+        "channel_status": None,
+        "channel_last_success_ts": None,
+        "worker_heartbeat_present": False,
+        "worker_online": False,
+        "worker_heartbeat_age_seconds": None,
+        "queue": {"pending": 0, "sent": 0, "failed": 0,
+                  "needs_check": 0, "skipped_empty": 0, "unreadable": 0},
+        "anomalies_present": False,
+        "anomalies_readable": False,
+        "anomalies_counts": {},
+    }
+    try:
+        pid, alive = _serve_alive()
+        out["serve_pid"] = pid
+        out["serve_alive"] = alive
+    except Exception:
+        pass
+    try:
+        ch = verify_channel_recovery()
+        out["channel_recovered"] = bool(ch.get("recovered"))
+        if isinstance(ch.get("reason"), str):
+            out["channel_reason"] = ch["reason"]
+        if isinstance(ch.get("status"), str):
+            out["channel_status"] = ch["status"]
+        if isinstance(ch.get("last_success_ts"), str):
+            out["channel_last_success_ts"] = ch["last_success_ts"]
+    except Exception:
+        pass
+    try:
+        ts, _src = read_worker_heartbeat()
+        out["worker_heartbeat_present"] = ts is not None
+        if ts is not None:
+            out["worker_heartbeat_age_seconds"] = int(time.time() - ts)
+        out["worker_online"] = not is_worker_offline()
+    except Exception:
+        pass
+    try:
+        s = get_observability_summary()
+        for k in out["queue"]:
+            v = s.get(k)
+            out["queue"][k] = v if (isinstance(v, int) and not isinstance(v, bool)) else 0
+    except Exception:
+        pass
+    try:
+        a = read_getupdates_anomalies()
+        out["anomalies_present"] = bool(a.get("present"))
+        out["anomalies_readable"] = bool(a.get("readable"))
+        counts = a.get("counts") or {}
+        out["anomalies_counts"] = {c: counts.get(c, 0) for c in GETUPDATES_ANOMALY_CATEGORIES}
+    except Exception:
+        pass
+    try:
+        _free_mb, _media_mb = _disk_watermark()
+        out["disk_free_mb"] = _free_mb
+        out["media_dir_size_mb"] = _media_mb
+    except Exception:
+        pass
+    return out
+
+
+def cmd_health(_args):
+    """Gate 3 CLI: print the health snapshot (read-only JSON)."""
+    ensure_dirs()
+    try:
+        print(json.dumps(get_bridge_health(), ensure_ascii=False, indent=2))
+    except Exception as e:
+        print(json.dumps({"schema": "bridge-health-0.1", "ok": False,
+                          "error_type": type(e).__name__}, ensure_ascii=False))
+    return 0
+
+
+def cmd_send_media(args, kind):
+    """Gate 3 CLI: send-video / send-file.
+
+    Direct send through the EXISTING send_video / send_file functions
+    (same upload + encrypt + sendmessage path the bridge already
+    uses), exactly like the text `send` command uses send_text. This
+    is NOT a new send path and NOT an outbox job: the sender loop is
+    not involved, no queue file is written, no queue format changes.
+    Exit codes mirror `send`: 3 no session, 14 token expired /
+    NEEDS_RELOGIN, 2 delivery unknown (may already be delivered, do
+    NOT auto-retry), 1 strict failure, 0 ok. No new delivery
+    semantics are invented: an unknown result stays unknown.
+    An optional --caption is sent AFTER the media succeeds, as a
+    separate text bubble via the existing send_text; a failed media
+    send never sends the caption, and a failed caption never retries
+    the media.
+    """
+    ensure_dirs()
+    name = "send-video" if kind == "video" else "send-file"
+    session = load_session()
+    if not session:
+        print(f"{name}: no session.json, run login first.", flush=True)
+        return 3
+    if os.path.exists(NEEDS_RELOGIN_FILE):
+        print(f"{name}: NEEDS_RELOGIN exists, refusing to send (re-login required).", flush=True)
+        return 14
+    path = args.path
+    if not os.path.isfile(path):
+        print(f"{name}: file missing: {path}", flush=True)
+        return 1
+    if not _is_allowed_image_path(path):
+        print(f"{name}: path outside allowed media dirs, refusing", flush=True)
+        return 1
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        print(f"{name}: cannot stat file", flush=True)
+        return 1
+    if size > MAX_VIDEO_PLAIN_BYTES:
+        print(f"{name}: over 100MiB", flush=True)
+        return 1
+    fn = send_video if kind == "video" else send_file
+    kwargs = {}
+    if kind == "file" and getattr(args, "file_name", None):
+        kwargs["file_name"] = args.file_name
+    try:
+        resp = fn(session, path, args.to, args.context_token,
+                  client_id=args.client_id, **kwargs)
+    except TokenExpired:
+        print(f"{name}: token expired (ret/errcode -14), wrote NEEDS_RELOGIN", flush=True)
+        return 14
+    except UnknownDeliveryError:
+        print(f"{name}: delivery unknown (may already be delivered, NOT auto-retried)", flush=True)
+        return 2
+    except Exception as e:
+        print(f"{name}: failed: {_sanitize_error(e)}", flush=True)
+        return 1
+    mid = resp.get("message_id") if isinstance(resp, dict) else None
+    mid_txt = f" message_id={mid}" if mid else ""
+    caption = getattr(args, "caption", None)
+    if caption:
+        try:
+            send_text(session, caption, to_user_id=args.to,
+                      context_token=args.context_token, client_id=None)
+        except TokenExpired:
+            print(f"{name}: ok (media sent, caption failed: token expired){mid_txt}", flush=True)
+            return 14
+        except UnknownDeliveryError:
+            print(f"{name}: ok (media sent, caption delivery unknown, NOT auto-retried){mid_txt}", flush=True)
+            return 2
+        except Exception as e:
+            print(f"{name}: ok (media sent, caption failed: {_sanitize_error(e)}){mid_txt}", flush=True)
+            return 1
+        print(f"{name}: ok (caption sent){mid_txt}", flush=True)
+        return 0
+    print(f"{name}: ok{mid_txt}", flush=True)
+    return 0
+
+
+def cmd_refresh_qr(args):
+    """Gate 3 CLI: resume a pending login QR code, nothing more.
+
+    Safety boundary (checked before anything else): this NEVER
+    requests a new QR code and NEVER touches session.json except
+    through the normal confirmed path inside cmd_login, which saves
+    a new session and clears NEEDS_RELOGIN only after the user scans
+    and confirms the pending code. With no pending QR code it
+    refuses and tells the user to run `login` for a fresh code; a
+    valid session is left untouched, and NEEDS_RELOGIN is never
+    cleared or bypassed by this command itself.
+    """
+    ensure_dirs()
+    pending = None
+    try:
+        with open(LOGIN_PENDING_FILE, encoding="utf-8") as f:
+            doc = json.load(f)
+        if isinstance(doc, dict) and doc.get("qrcode"):
+            pending = doc
+    except Exception:
+        pending = None
+    if not pending:
+        print("refresh-qr: no pending QR code (expired or never requested); "
+              "run `login` for a fresh code. Session untouched.", flush=True)
+        return 1
+    ns = argparse.Namespace(resume=True, verify_code=args.verify_code,
+                            timeout=args.timeout)
+    return cmd_login(ns)
+
+
 def cmd_resend_text_part(args):
     """Item 3 manual resend: reset ONE text part to 'pending'.
 
@@ -5672,6 +8963,27 @@ def main(argv=None):
     p_resend.add_argument("part", type=int, help="1-based part number, as shown in [i/N]")
     sub.add_parser("verify-channel", help="Production Worker channel-recovery check (read-only JSON, exit 0 only if recovered)")
     sub.add_parser("safe-view", help="Print the deterministic safe history view (read-only JSON)")
+    p_obs = sub.add_parser("observability", help="Gate 1 item 2: print one job's stage view (read-only JSON, no text or tokens)")
+    p_obs.add_argument("job", help="Job filename in outbox/sent/, outbox/failed/ or outbox/pending/, with or without .json")
+    sub.add_parser("observability-summary", help="Gate 1 item 2: print outbox counts by bucket (read-only JSON, counts only)")
+    sub.add_parser("getupdates-anomalies", help="Gate 2: print desensitised getupdates anomaly counts (read-only JSON, no tokens or text)")
+    p_sv = sub.add_parser("send-video", help="Gate 3: send a video file directly (existing send path, not a queue job)")
+    p_sv.add_argument("path", help="Local file under media/inbound/ or media/outbound/")
+    p_sv.add_argument("--to", default=None)
+    p_sv.add_argument("--context-token", default=None)
+    p_sv.add_argument("--client-id", default=None)
+    p_sv.add_argument("--caption", default=None, help="Optional text sent as a separate bubble after the media succeeds")
+    p_sf = sub.add_parser("send-file", help="Gate 3: send a file directly (existing send path, not a queue job)")
+    p_sf.add_argument("path", help="Local file under media/inbound/ or media/outbound/")
+    p_sf.add_argument("--to", default=None)
+    p_sf.add_argument("--context-token", default=None)
+    p_sf.add_argument("--client-id", default=None)
+    p_sf.add_argument("--caption", default=None, help="Optional text sent as a separate bubble after the media succeeds")
+    p_sf.add_argument("--file-name", default=None, help="Display name; default is the file basename")
+    sub.add_parser("health", help="Gate 3: print desensitised bridge health (read-only JSON, no tokens, URLs, user ids or text)")
+    p_rq = sub.add_parser("refresh-qr", help="Gate 3: resume a pending login QR code (never requests a new code, never touches a valid session)")
+    p_rq.add_argument("--verify-code", default=None, help="Verification code shown in WeChat")
+    p_rq.add_argument("--timeout", type=int, default=180, help="Seconds to poll for scan")
     args = parser.parse_args(argv)
     ensure_dirs()
     if args.cmd == "login":
@@ -5686,6 +8998,14 @@ def main(argv=None):
         view = build_safe_history_view()
         print(json.dumps(view, ensure_ascii=False, indent=2))
         return 0
+    if args.cmd == "observability":
+        print(json.dumps(get_message_observability(args.job), ensure_ascii=False, indent=2))
+        return 0
+    if args.cmd == "observability-summary":
+        print(json.dumps(get_observability_summary(), ensure_ascii=False, indent=2))
+        return 0
+    if args.cmd == "getupdates-anomalies":
+        return cmd_getupdates_anomalies(args)
     if args.cmd == "verify-channel":
         return cmd_verify_channel(args)
     if args.cmd == "send":
@@ -5703,6 +9023,14 @@ def main(argv=None):
             return 1
         print("send: ok", flush=True)
         return 0
+    if args.cmd == "send-video":
+        return cmd_send_media(args, "video")
+    if args.cmd == "send-file":
+        return cmd_send_media(args, "file")
+    if args.cmd == "health":
+        return cmd_health(args)
+    if args.cmd == "refresh-qr":
+        return cmd_refresh_qr(args)
     return 2
 
 

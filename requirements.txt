@@ -1,11 +1,27 @@
-# Muse WeChat iLink bridge - Python dependencies.
-# Install: pip install -r requirements.txt
-# Notes:
-# - Pillow is a runtime dependency: full image decode (im.load()), not just header read.
-# - qrcode is LOGIN-ONLY: it renders login_qr.png in cmd_login. bridge.py serve
-#   itself does not import qrcode and does not need it at runtime.
-# - System openssl and curl are NOT pip packages and are NOT listed here;
-#   they must be present on the host (openssl for AES-128-ECB, curl for
-#   post_json/get_json transport and image curl fallback).
-Pillow
+# 微信桥 Python 依赖（钉号版，2026-11-01 生产快照口径，随 v1.4.0 发布）
+# 安装方式：pip install -r requirements.txt（必须用运行 serve 的那个用户装，
+# 且 pypdf / python-docx / openpyxl 必须能被 serve 进程的 python  import，
+# 否则解析子进程会回落或失败；曾出现过普通用户装了、root 跑的 serve 看不见的坑）。
+#
+# 分工（两个解释器，两组依赖，不要混成一组装完就以为万事大吉）：
+# --- serve 进程的 python（桥本体 + doc_parser 子进程）需要：
+Pillow==13.0.0
 qrcode
+pycryptodome==4.2.0
+pypdf==6.21.4
+python-docx==1.1.0
+openpyxl==3.1.2
+# --- 分析器 venv 的 python（M2 视频分析，见 WECHAT_BRIDGE_ANALYZER_PY）需要：
+faster-whisper==1.2.1
+ppocr_lite==0.4.0
+ai-edge-litert==2.3.0
+onnxruntime==1.31.1
+scenedetect==0.7.2
+av==12.3.0
+numpy==2.5.4
+Pillow==13.0.0
+#
+# 宿主工具（不是 pip 包，必须另装）：ffmpeg / ffprobe、curl、openssl（openssl
+# 仅作回滚后盾，现行 AES 已是进程内实现，不再走 openssl 子进程）。
+# 说明：qrcode 仅登录时用（渲染 login_qr.png），serve 本身不 import 它，
+# 上游未给它钉号，这里保持不钉；其余钉号均来自生产核实。
