@@ -1,0 +1,51 @@
+# CI regression check (v1.5.0 item 4).
+#
+# This is a QUALITY SIGNAL, not a gate: it does not block merges,
+# releases or deploys. If a release gate is wanted later, it must be
+# decided separately: gate only the release node, and require the
+# release candidate's own CI run to pass (GitHub required checks are
+# what actually constrain merges; this workflow alone does not).
+#
+# Version iron rule: a green run here covers exactly the tree it ran
+# on (the pushed commit). A fix-copy pass is NOT a pass of a
+# hunk-transplanted product tree; release acceptance must point at
+# the final assembled code's SHA/commit, never at a different tree's
+# green run.
+#
+# What runs: tests/run_ci.py, the unified entry defined by
+# tests/CI-MANIFEST.md. --skip-100mb is passed because the public
+# tree carries the 10 MiB caps; test_file_inbound_100mb asserts
+# fix-copy-only 100 MiB constants and must not run here (the skip
+# is printed by the runner, never silent).
+#
+# No production session, chat record or real media is used: every
+# suite runs in temp dirs on synthetic data by design.
+
+name: CI regression check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  regression:
+    name: regression (ubuntu, system python)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl jq openssl ffmpeg
+
+      - name: Install Python test dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install Pillow qrcode pycryptodome==4.2.0 python-docx openpyxl pypdf
+
+      - name: Run unified regression entry
+        run: python3 tests/run_ci.py --bridge bridge.py --skip-100mb
