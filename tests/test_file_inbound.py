@@ -228,15 +228,22 @@ def test_process_paths(server):
             "910005", 0, time.time() + 60, bridge.FILE_MESSAGE_TOTAL_CAP)
         check("process: truncated cipher -> BAD_CIPHER_SIZE",
               saved is None and (diag or {}).get("error_code") == "BAD_CIPHER_SIZE")
-        # Over cipher cap: 11 MiB body.
-        big = os.urandom(11 * 1024 * 1024)
-        ROUTES["/big.bin"] = (200, {"Content-Length": str(len(big))}, big)
-        saved, err, diag = bridge.process_inbound_file(
-            _key_item(server.url("/big.bin"), key, "big.bin"),
-            "910006", 0, time.time() + 60, bridge.FILE_MESSAGE_TOTAL_CAP)
-        check("process: over-cap download -> error, no save",
-              saved is None and (diag or {}).get("error_code") in
-              ("CURL_DOWNLOAD_FAILED", "OVER_CIPHER_CAP"))
+        # Over cipher cap: patched small cap (no 100 MiB fixture) +
+        # a body above it. Intent unchanged: over-cap download errors,
+        # nothing is saved.
+        old_cipher_cap = bridge.FILE_SINGLE_CIPHER_CAP
+        bridge.FILE_SINGLE_CIPHER_CAP = 1024
+        try:
+            big = os.urandom(2048)
+            ROUTES["/big.bin"] = (200, {"Content-Length": str(len(big))}, big)
+            saved, err, diag = bridge.process_inbound_file(
+                _key_item(server.url("/big.bin"), key, "big.bin"),
+                "910006", 0, time.time() + 60, bridge.FILE_MESSAGE_TOTAL_CAP)
+            check("process: over-cap download -> error, no save",
+                  saved is None and (diag or {}).get("error_code") in
+                  ("CURL_DOWNLOAD_FAILED", "OVER_CIPHER_CAP"))
+        finally:
+            bridge.FILE_SINGLE_CIPHER_CAP = old_cipher_cap
         # Past deadline: no download.
         HITS.clear()
         saved, err, diag = bridge.process_inbound_file(

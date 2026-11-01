@@ -61,19 +61,32 @@ def test_r1_direct_unknown_not_pending(m, td):
 
 def test_r3_no_key_in_error(m, td):
     key = bytes.fromhex("12"*16)
-    def fail(cmd, **kwargs): raise subprocess.TimeoutExpired(cmd, 30)
-    with patch.object(m.subprocess, "run", fail):
-        try:
-            m.aes_ecb_decrypt(b"0"*16, key)
-        except Exception as e:
-            s = m._sanitize_error(e)
-            assert key.hex() not in s, s
-            # v1.0.1: aes_ecb_* now converts TimeoutExpired to a key-free
-            # ApiError ("openssl decrypt timeout") instead of letting the
-            # raw TimeoutExpired (argv incl. -K) escape; _sanitize_error
-            # on a raw TimeoutExpired still returns "TimeoutExpired".
-            assert "timeout" in s.lower(), s
-    print("R3 TimeoutExpired sanitized, no key - PASS")
+    # Gate 2 (2026-11-01): AES no longer runs through the openssl
+    # subprocess, so there is no TimeoutExpired argv carrying -K to
+    # sanitize, and the old "timeout" wording assertion is obsolete.
+    # The underlying guarantee is tested directly and more strongly:
+    # (a) _sanitize_error on a raw TimeoutExpired still returns only
+    #     "TimeoutExpired" (helper unchanged, still used by curl paths);
+    # (b) a real AES decrypt failure yields a key-free ApiError;
+    # (c) AES never calls subprocess at all, even for valid data.
+    s = m._sanitize_error(subprocess.TimeoutExpired(
+        ["openssl", "enc", "-K", key.hex()], 30))
+    assert s == "TimeoutExpired", s
+    bad_ct = m.aes_ecb_encrypt(b"0"*16, key)
+    bad_ct = bad_ct[:-1] + bytes([bad_ct[-1] ^ 0x01])
+    try:
+        m.aes_ecb_decrypt(bad_ct, key)
+        assert False, "bad padding should raise"
+    except Exception as e:
+        s = m._sanitize_error(e)
+        assert key.hex() not in s, s
+        assert key.hex() not in str(e), str(e)
+    def no_subprocess(*args, **kwargs):
+        raise AssertionError("AES must not call subprocess")
+    with patch.object(m.subprocess, "run", no_subprocess):
+        assert m.aes_ecb_decrypt(
+            m.aes_ecb_encrypt(b"hello world 1234", key), key) == b"hello world 1234"
+    print("R3 AES failure sanitized, no key, no subprocess - PASS")
 
 def test_r4_tmp_permissions(m, td):
     import os

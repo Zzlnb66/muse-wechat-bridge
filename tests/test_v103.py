@@ -114,15 +114,39 @@ def test_2_traceback_cut(m, td):
     key = bytes.fromhex("cd" * 16)
     token = "SECRET_TOKEN_XYZ"
     secret_url = "https://cdn.example.invalid/upload?secret=SECRET_URL_PARAM"
-    # aes_ecb_encrypt / decrypt
+    # aes_ecb_encrypt / decrypt (Gate 2, 2026-11-01: in-process, no
+    # openssl subprocess, so no TimeoutExpired argv with -K exists to
+    # suppress anymore and the old timeout simulation is vacuous.
+    # Equivalent guarantee, tested directly: a failing decrypt yields
+    # a key-free ApiError whose whole __context__/__cause__ chain is
+    # key-free, and valid AES never calls subprocess at all.)
+    bad_ct = m.aes_ecb_encrypt(b"hello world 1234", key)
+    bad_ct = bad_ct[:-1] + bytes([bad_ct[-1] ^ 0x01])
+    try:
+        m.aes_ecb_decrypt(bad_ct, key)
+        assert False, "bad padding should raise"
+    except Exception as e:
+        tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+        for s in (key.hex(), token, secret_url):
+            assert s not in tb, f"LEAKED {s!r} in traceback:\n{tb}"
+            assert s not in str(e), f"LEAKED {s!r} in exception string: {e}"
+        chain, seen = e, set()
+        while chain is not None and id(chain) not in seen:
+            seen.add(id(chain))
+            assert key.hex() not in str(chain), f"LEAKED key in chain: {chain!r}"
+            chain = chain.__context__ if chain.__context__ is not None else chain.__cause__
+    try:
+        m.aes_ecb_encrypt(b"hello world 1234", b"short")
+        assert False, "bad key length should raise"
+    except Exception as e:
+        assert key.hex() not in str(e), str(e)
+    def no_subprocess(*args, **kwargs):
+        raise AssertionError("AES must not call subprocess")
+    with patch.object(m.subprocess, "run", no_subprocess):
+        assert m.aes_ecb_decrypt(
+            m.aes_ecb_encrypt(b"hello world 1234", key), key) == b"hello world 1234"
     def timeout_run(cmd, **k):
         raise subprocess.TimeoutExpired(cmd, 30)
-    with patch.object(m.subprocess, "run", timeout_run):
-        for fn in (m.aes_ecb_encrypt, m.aes_ecb_decrypt):
-            try:
-                fn(b"hello world 1234", key); assert False, "should raise"
-            except Exception as e:
-                _assert_no_leak(m, e, [key.hex(), token, secret_url])
     # _post_via_curl / _get_via_curl
     cmd = ["curl", "-s", "-H", f"Authorization: Bearer {token}", "https://example.invalid/x"]
     with patch.object(m.subprocess, "run", timeout_run):

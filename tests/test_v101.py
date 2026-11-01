@@ -2,8 +2,17 @@
 Offline, synthetic data only, no WeChat, no real keys.
 Run: python3 tests/test_v101.py /path/to/bridge.py
 
-1. Send-image OpenSSL timeout must not leak the AES key into any
-   stored error, log string, or failed job file.
+1. AES is in-process since Gate 2 (no subprocess, no 30 s openssl
+   timeout): the old subprocess-timeout key-leak test is split in two.
+   1a proves the in-process path never spawns subprocess (counting
+   mock must record zero calls) and round-trips correctly.
+   1b keeps the drain-level timeout desensitisation: a send that
+   raises TimeoutExpired with key hex in argv must still store no
+   key in any failed/pending job file.
+   (False-green fix, CI item 2026-11-01: the old 1a caught broad
+   Exception, so its `assert False` was swallowed and the test
+   passed without ever exercising the timeout path. The new 1a
+   catches nothing broad and asserts the mock call count.)
 2. Fast reply (/ping) outbox write failure must NOT mark processed
    and must NOT advance the batch cursor.
 3. A failed/ move failure must NOT cause a second send attempt:
@@ -30,21 +39,34 @@ def isolated(m):
     m.ensure_dirs(); m.save_session(dict(SESSION))
     return td
 
-def test_1_send_timeout_no_key(m, td):
+def test_1a_aes_inprocess_no_subprocess(m, td):
     # Synthetic key that must never appear in any stored error.
     key = bytes.fromhex("ab" * 16)
-    assert key.hex() not in "ab" * 0  # sanity: key.hex() is a real 32-char hex
-    def fail(cmd, **kwargs):
-        raise subprocess.TimeoutExpired(cmd, 30)
-    with patch.object(m.subprocess, "run", fail):
-        try:
-            m.aes_ecb_encrypt(b"hello world 1234", key)
-            assert False, "should raise"
-        except Exception as e:
-            # The exception itself must not carry the key, and the
-            # sanitizer used by drain_outbox must not either.
-            assert key.hex() not in str(e), str(e)
-            assert m._sanitize_error(e) == "openssl encrypt timeout" or key.hex() not in m._sanitize_error(e)
+    calls = []
+    def counting_run(cmd, **kwargs):
+        calls.append(cmd)
+        raise AssertionError("in-process AES must not spawn subprocess")
+    with patch.object(m.subprocess, "run", counting_run):
+        ct = m.aes_ecb_encrypt(b"hello world 1234", key)
+        assert ct != b"hello world 1234", "ciphertext must differ from plaintext"
+        assert m.aes_ecb_decrypt(ct, key) == b"hello world 1234", "round-trip failed"
+    # The mock assertion is the point: if AES ever went back to a
+    # subprocess, counting_run would raise and this test would fail
+    # loudly instead of passing vacuously. No broad except here.
+    assert calls == [], f"in-process AES spawned subprocess: {calls}"
+    # Strict-failure path: a bad key raises the documented ApiError
+    # only (never TimeoutExpired, never a raw ValueError).
+    try:
+        m.aes_ecb_encrypt(b"hello world 1234", b"short")
+    except m.ApiError:
+        pass
+    else:
+        raise AssertionError("bad key must raise ApiError")
+    print("v1.0.1-1a in-process AES: no subprocess, round-trip ok, ApiError only - PASS")
+
+def test_1b_send_timeout_no_key(m, td):
+    # Synthetic key that must never appear in any stored error.
+    key = bytes.fromhex("ab" * 16)
     # Drain-level: an attachment whose send raises TimeoutExpired
     # (raw, as aes_ecb_encrypt used to) must be stored sanitized.
     job = {"text": None, "to_user_id": SESSION["ilink_user_id"],
@@ -73,7 +95,7 @@ def test_1_send_timeout_no_key(m, td):
         content = pending.read_text()
         assert key.hex() not in content, "KEY LEAKED into pending job file"
         assert "job101.json" in m._TERMINAL_TASK_IDS, "move-failed/terminal job not in terminal set"
-    print("v1.0.1-1 send timeout: no key in exception, sanitizer, or stored job - PASS")
+    print("v1.0.1-1b send timeout: no key in stored job - PASS")
 
 def test_2_fast_reply_enqueue_failure(m, td):
     # Serve loop with a single /ping, outbox write forced to fail.
@@ -139,7 +161,8 @@ def main():
     source = sys.argv[1]
     m = load(source)
     td = isolated(m)
-    test_1_send_timeout_no_key(m, td)
+    test_1a_aes_inprocess_no_subprocess(m, td)
+    test_1b_send_timeout_no_key(m, td)
     # Fresh state for test 2 (processed/cursor pollution from test 1)
     td2 = isolated(m)
     # serve_loop test needs a fresh module state for processed; reuse isolated dirs
