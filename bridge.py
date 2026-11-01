@@ -1224,6 +1224,220 @@ def fast_command_reply(text):
     return None
 
 
+# ---- Tier-1 bridge-side chat command table ----
+# Same interception road as the M3 local follow-up precedent in
+# serve_loop: AFTER the group/whitelist filter, BEFORE any
+# inbox write or merge staging, reply via send_direct_or_outbox
+# (queue-only, the sender loop sends), mark processed, and never
+# let the message reach the Worker. No new send path is invented.
+# Timeline, same as local/fast replies: the command message
+# itself gets NO "received" event (that event is only recorded
+# on inbox write); the reply job records "queued" via
+# send_direct_or_outbox and counts as a genuine sent reply
+# (only *_progress/_offline/_queue suffixes are excluded).
+# The legacy fast path (/ping, old /status) in
+# fast_command_reply is left untouched. This table is checked
+# FIRST in serve_loop, so /ping falls through to the legacy
+# reply (byte-identical) while /status is answered by the new
+# spec below; the old /status branch is therefore shadowed in
+# serve flow but still covered by its old unit tests.
+# Replies carry counts and states only: never a token, a user
+# id, a URL, or the original message text. Trailing arguments
+# after a known command are ignored, never echoed.
+
+_CMD_TOKEN_RE = re.compile(r"^/[a-z_]+$")
+
+_CHAT_COMMAND_UNKNOWN = "没有这个指令，输入 /help 查看可用指令。"
+
+_CHAT_COMMAND_FALLBACK = "指令处理失败，请稍后重试。"
+
+
+def parse_command_attempt(text):
+    """Return the leading /command token, or None.
+
+    A command attempt is: stripped text starts with "/", and the
+    first whitespace-separated token matches ^/[a-z_]+$.
+    Anything else ("/今天天气", "/", "/123", "/STATUS", plain
+    text) is NOT an attempt and flows through the normal path
+    untouched.
+    """
+    if not text:
+        return None
+    stripped = text.strip()
+    if not stripped.startswith("/"):
+        return None
+    token = stripped.split(None, 1)[0]
+    if _CMD_TOKEN_RE.match(token):
+        return token
+    return None
+
+
+def _bucket(summary, key):
+    """One observability bucket as int, or "未知" when absent."""
+    try:
+        v = (summary or {}).get(key)
+    except Exception:
+        return "未知"
+    return v if isinstance(v, int) else "未知"
+
+
+def _channel_line(recovered, reason):
+    if recovered:
+        return "通道：已恢复"
+    if reason:
+        return "通道：未恢复（%s）" % reason
+    return "通道：未恢复"
+
+
+def build_status_reply(summary, recovered, reason=None):
+    """Deterministic /status text: counts + channel state only."""
+    return (
+        "桥接状态：serve 运行中\n"
+        "%s\n"
+        "待发送：%s，待核对：%s，已发送：%s，失败：%s，"
+        "跳过空：%s，不可读：%s"
+        % (_channel_line(recovered, reason),
+           _bucket(summary, "pending"), _bucket(summary, "needs_check"),
+           _bucket(summary, "sent"), _bucket(summary, "failed"),
+           _bucket(summary, "skipped_empty"), _bucket(summary, "unreadable"))
+    )
+
+
+def build_health_reply(recovered, reason, hb_present, hb_age, free_mb, media_mb):
+    """Deterministic /health text: serve, channel, heartbeat, disk."""
+    if hb_present:
+        hb = "Worker 心跳：有（%s 秒前）" % (hb_age if isinstance(hb_age, int) else "未知")
+    else:
+        hb = "Worker 心跳：无"
+    free = "%s MB" % free_mb if isinstance(free_mb, int) else "未知"
+    media = "%s MB" % media_mb if isinstance(media_mb, int) else "未知"
+    return (
+        "桥接健康：serve 运行中\n"
+        "%s\n"
+        "%s\n"
+        "磁盘剩余：%s，媒体目录：%s"
+        % (_channel_line(recovered, reason), hb, free, media)
+    )
+
+
+def build_queue_reply(summary, oldest_age):
+    """Deterministic /queue text: buckets + oldest pending age."""
+    if isinstance(oldest_age, int):
+        age = "%s 秒前" % oldest_age
+    else:
+        age = "无（待发送为 0）"
+    return (
+        "队列：待发送 %s 条，待核对 %s 条，已发送 %s 条，失败 %s 条\n"
+        "最老待发送：%s"
+        % (_bucket(summary, "pending"), _bucket(summary, "needs_check"),
+           _bucket(summary, "sent"), _bucket(summary, "failed"), age)
+    )
+
+
+def build_help_reply():
+    """Deterministic /help text: the four commands + the red line."""
+    return (
+        "可用指令：\n"
+        "/status 桥接状态\n"
+        "/health 桥接健康\n"
+        "/queue 队列情况\n"
+        "/help 显示本帮助\n"
+        "踢人、动钱、改设置等敏感操作不在指令表内，请回 Muse App 确认。"
+    )
+
+
+def _oldest_pending_age_seconds():
+    """Oldest retryable pending job age in seconds, or None.
+
+    Auxiliary suffixes (_progress/_offline/_queue) are excluded,
+    matching the observability summary buckets. Never raises.
+    """
+    try:
+        ages = []
+        for name in os.listdir(OUTBOX_PENDING):
+            if not name.endswith(".json"):
+                continue
+            if name.endswith(("_progress.json", "_offline.json", "_queue.json")):
+                continue
+            try:
+                ages.append(time.time() - os.path.getmtime(os.path.join(OUTBOX_PENDING, name)))
+            except OSError:
+                continue
+        return int(max(ages)) if ages else None
+    except Exception:
+        return None
+
+
+def live_command_context():
+    """Assemble read-only live values for a command reply.
+
+    Every read is guarded: a failed read degrades to None/False
+    instead of raising, so a command reply never kills serve.
+    Channel recovered uses verify_channel_recovery (read-only:
+    it never writes, sends, or restarts anything).
+    """
+    ctx = {"summary": None, "recovered": False, "reason": None,
+           "hb_present": False, "hb_age": None,
+           "free_mb": None, "media_mb": None, "oldest_age": None}
+    try:
+        ctx["summary"] = get_observability_summary()
+    except Exception:
+        ctx["summary"] = None
+    try:
+        _rec = verify_channel_recovery()
+        ctx["recovered"] = bool(_rec.get("recovered")) if isinstance(_rec, dict) else False
+        if not ctx["recovered"] and isinstance(_rec, dict):
+            ctx["reason"] = _rec.get("reason")
+    except Exception:
+        ctx["recovered"] = False
+        ctx["reason"] = "check_failed"
+    try:
+        _ts, _src = read_worker_heartbeat()
+        ctx["hb_present"] = _ts is not None
+        if _ts is not None:
+            ctx["hb_age"] = int(time.time() - _ts)
+    except Exception:
+        ctx["hb_present"] = False
+        ctx["hb_age"] = None
+    try:
+        ctx["free_mb"], ctx["media_mb"] = _disk_watermark()
+    except Exception:
+        ctx["free_mb"], ctx["media_mb"] = None, None
+    ctx["oldest_age"] = _oldest_pending_age_seconds()
+    return ctx
+
+
+def chat_command_reply(text, ctx=None):
+    """Answer a tier-1 chat command, or None.
+
+    None means "not handled here": either not a command attempt
+    (flows through the normal path) or /ping (the legacy fast
+    path below answers it byte-identically). Every other matched
+    /token is answered here and must never reach the Worker.
+    Builders never raise: on any unexpected error the fixed
+    fallback sentence is returned, preserving interception.
+    """
+    token = parse_command_attempt(text)
+    if token is None or token == "/ping":
+        return None
+    try:
+        if ctx is None:
+            ctx = live_command_context()
+        if token == "/status":
+            return build_status_reply(ctx.get("summary"), ctx.get("recovered"), ctx.get("reason"))
+        if token == "/health":
+            return build_health_reply(ctx.get("recovered"), ctx.get("reason"),
+                                      ctx.get("hb_present"), ctx.get("hb_age"),
+                                      ctx.get("free_mb"), ctx.get("media_mb"))
+        if token == "/queue":
+            return build_queue_reply(ctx.get("summary"), ctx.get("oldest_age"))
+        if token == "/help":
+            return build_help_reply()
+        return _CHAT_COMMAND_UNKNOWN
+    except Exception:
+        return _CHAT_COMMAND_FALLBACK
+
+
 # Typing state, process-local only. Never printed, never logged.
 _typing_ticket_cache = {"ticket": None, "ts": 0}
 _typing_last_send = {"ts": 0}
@@ -7631,6 +7845,48 @@ def _sender_loop(session, stop_event, sent_queue):
         stop_event.wait(1.0)
 
 
+# v1.5.0 item 2 (backoff tiers, GPT conditional pass 2026-11-01):
+# Tiered getupdates backoff, getupdates ONLY (never sendmessage).
+# Sequence is fixed: consecutive rate_limited polls wait 5, 10, 20,
+# 30, then 30 s capped. 30 s is a LOCAL backoff cap only: it covers
+# neither request/transport fallback, nor later polls, nor Worker or
+# send waits, and must never be described as an end-to-end delay bound.
+# MINIMAL TIER ONLY (GPT boundary, documented, not silently complete):
+# this tiers only rate_limited already identified by
+# classify_getupdates_error. The curl helper does not preserve full
+# HTTP status or Retry-After, and post_json may fall back to urllib
+# immediately after a curl failure, so a raw HTTP 429 / Retry-After
+# that the classifier does not recognise is NOT covered here. The
+# full tier (structured status on both transports, honour Retry-After
+# even above 30 s, no immediate transport switch after a confirmed
+# limit) is a separate follow-up, not claimed by this change.
+# -14 (TokenExpired) never enters backoff: its branch returns 14
+# before this code runs, and classification priority keeps it first.
+_RATE_LIMIT_DELAYS = (5, 10, 20, 30, 30)
+
+
+def _rate_limit_delay(streak):
+    """Backoff seconds for the streak-th consecutive rate_limited poll
+    (1-based). Zero or negative streaks mean 'not in a streak' -> 5 s."""
+    if streak <= 0:
+        return _RATE_LIMIT_DELAYS[0]
+    return _RATE_LIMIT_DELAYS[min(streak, len(_RATE_LIMIT_DELAYS)) - 1]
+
+
+def _interruptible_sleep(seconds, stop_predicate):
+    """Sleep in 0.5 s slices. Returns True as soon as stop_predicate
+    fires (the poll loop's own stop signal), else False after the
+    full duration. Never a single uninterruptible sleep(30)."""
+    deadline = time.monotonic() + seconds
+    while True:
+        if stop_predicate():
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.5, remaining))
+
+
 def serve_loop():
 
     ensure_dirs()
@@ -7709,6 +7965,10 @@ def serve_loop():
     processed = load_processed()
     # Phase 2 step 3: message_id -> typing ticket, for cancel-on-finish.
     typing_by_msg = {}
+    # v1.5.0 item 2: consecutive rate_limited streak for tiered backoff.
+    # Reset on any valid success (incl. empty msgs); any other error
+    # breaks the streak (it is not counted as a new limit).
+    _rate_limited_streak = 0
     while True:
         if os.path.exists(NEEDS_RELOGIN_FILE):
             _sender_stop.set()
@@ -7839,6 +8099,9 @@ def serve_loop():
             )
             check_ret(resp, "getupdates")
             _record_channel_status(True)
+            # v1.5.0 item 2: any valid success response (incl. msgs=[])
+            # resets the consecutive rate-limit streak.
+            _rate_limited_streak = 0
         except TokenExpired as e:
             # Gate 2 -14 counting: the -14 stop itself is unchanged
             # (NEEDS_RELOGIN already written by check_ret/post_json,
@@ -7848,15 +8111,31 @@ def serve_loop():
             print("serve: token expired (-14), wrote NEEDS_RELOGIN, stopping.", flush=True)
             return 14
         except Exception as e:
-            # Gate 2 -14 counting: bucket the poll failure, then the
-            # existing backoff path runs unchanged (5s sleep, continue).
+            # v1.5.0 item 2: tiered backoff (replaces the flat 5 s sleep).
+            # Gate 2 counting is unchanged; only the wait is tiered.
+            # -14 never reaches here (TokenExpired branch returns 14).
             _cat, _det = classify_getupdates_error(e)
             record_getupdates_anomaly(_cat, _det)
             # v1.0.2: post_json now carries curl_err + urllib_err +
             # desensitized target/proxy; sanitise again as defence in depth.
             _record_channel_status(False, _sanitize_error(e))
-            _log_ts(f"serve: getupdates error, backing off 5s: {_sanitize_error(e)}")
-            time.sleep(5)
+            if _cat == "rate_limited":
+                _rate_limited_streak += 1
+                _delay = _rate_limit_delay(_rate_limited_streak)
+            else:
+                # Any other error breaks the consecutive rate-limit
+                # sequence; it is not counted as a new limit.
+                _rate_limited_streak = 0
+                _delay = 5
+            _log_ts(f"serve: getupdates error ({_cat}), backing off {_delay}s: {_sanitize_error(e)}")
+            # Interruptible wait on the poll loop's own stop signal
+            # (NEEDS_RELOGIN appearance, also checked at loop top).
+            # The sender thread is independent (own 1 s tick) and is
+            # never paused by this wait.
+            if _interruptible_sleep(_delay, lambda: os.path.exists(NEEDS_RELOGIN_FILE)):
+                _sender_stop.set()
+                print("serve: stop requested during backoff, stopping.", flush=True)
+                return 14
             continue
         new_cursor = resp.get("get_updates_buf")
         msgs = resp.get("msgs") or []
@@ -8000,6 +8279,27 @@ def serve_loop():
                     continue
                 processed.add(mid); save_processed(processed)
                 print(f"serve: local query for {mid} -> video {_video_mid}", flush=True)
+                continue
+            # Tier-1 chat command table: same interception road as
+            # the M3 local follow-up above (after group/whitelist
+            # filter, before inbox/merge staging). /ping falls
+            # through to the legacy fast path below; every other
+            # matched /token is answered here and never reaches
+            # the Worker.
+            _cmd_reply = chat_command_reply(text) if text else None
+            if _cmd_reply is not None:
+                try:
+                    _queued = send_direct_or_outbox(session, _cmd_reply, session.get("ilink_user_id"),
+                                          ctx, f"{mid}_cmd.json")
+                except TokenExpired:
+                    print("serve: token expired during chat command, stopping.", flush=True)
+                    return 14
+                if not _queued:
+                    _batch_enqueue_failed = True
+                    print(f"serve: chat command reply queue FAILED for {mid}, NOT marking processed, will retry", flush=True)
+                    continue
+                processed.add(mid); save_processed(processed)
+                print(f"serve: chat command for {mid}", flush=True)
                 continue
             # Phase 2 step 3: fast commands, direct reply, no inbox, no Worker.
             fast = fast_command_reply(text) if text else None
